@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Canva 批量字号",
+  "version": "1.0.0",
+  "description": "一键把 Canva 设计中所有页面的字幕字号统一设置（通过可信调试事件操作，跳过小号水印文字）。",
+  "permissions": ["debugger", "tabs", "storage", "sidePanel"],
+  "host_permissions": ["https://*.canva.com/*", "https://openrouter.ai/*", "https://generativelanguage.googleapis.com/*", "http://localhost/*"],
+  "action": {
+    "default_title": "Canva 批量字号"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

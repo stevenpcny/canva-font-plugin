@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    :root { color-scheme: light; }
+    body {
+      font-family: -apple-system, "PingFang SC", system-ui, sans-serif;
+      width: 320px; margin: 0; padding: 16px; color: #1a1a2e; background: #fff;
+    }
+    h1 { font-size: 15px; margin: 0 0 12px; }
+    .row { margin-bottom: 12px; }
+    label { display: block; font-size: 12px; color: #555; margin-bottom: 4px; }
+    input[type="number"] {
+      width: 100%; box-sizing: border-box; padding: 8px 10px;
+      border: 1px solid #ccc; border-radius: 8px; font-size: 14px;
+    }
+    .hint { font-size: 11px; color: #888; margin-top: 4px; line-height: 1.4; }
+    button {
+      width: 100%; padding: 10px; border: none; border-radius: 8px;
+      background: #7c3aed; color: #fff; font-size: 14px; font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { background: #c4b5fd; cursor: default; }
+    #log {
+      margin-top: 12px; font-size: 12px; line-height: 1.5; max-height: 180px;
+      overflow-y: auto; background: #f6f6fb; border-radius: 8px; padding: 8px 10px;
+      white-space: pre-wrap; word-break: break-all; display: none;
+    }
+    .warn {
+      font-size: 11px; color: #b45309; background: #fffbeb;
+      border: 1px solid #fde68a; border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
+    }
+    #status { font-size: 12px; color: #7c3aed; margin-top: 8px; min-height: 16px; }
+    hr { border: none; border-top: 1px solid #eee; margin: 16px 0; }
+    .section-title { font-size: 13px; font-weight: 600; margin: 0 0 10px; }
+    .color-row { display: flex; align-items: center; gap: 8px; }
+    input[type="color"] {
+      width: 44px; height: 36px; padding: 0; border: 1px solid #ccc;
+      border-radius: 8px; background: #fff; cursor: pointer;
+    }
+    input[type="text"] {
+      flex: 1; box-sizing: border-box; padding: 8px 10px;
+      border: 1px solid #ccc; border-radius: 8px; font-size: 14px; text-transform: uppercase;
+    }
+    .api-key-input { text-transform: none; }
+    .key-row { display: flex; gap: 6px; }
+    textarea {
+      width: 100%; box-sizing: border-box; padding: 8px 10px;
+      border: 1px solid #ccc; border-radius: 8px; font-size: 11px;
+      line-height: 1.5; resize: vertical; font-family: inherit;
+    }
+    .key-row input { flex: 1; }
+    .key-row button { width: auto; padding: 8px 14px; font-size: 12px; }
+    .diff-add { color: #16a34a; }
+    .diff-del { color: #dc2626; text-decoration: line-through; }
+    .diff-reason { color: #888; font-style: italic; }
+    #proofLog {
+      margin-top: 8px; font-size: 12px; line-height: 1.6; max-height: 220px;
+      overflow-y: auto; background: #f6f6fb; border-radius: 8px; padding: 8px 10px;
+      display: none;
+    }
+    .btn-secondary {
+      background: #059669; margin-top: 8px;
+    }
+    .btn-secondary:disabled { background: #a7f3d0; }
+  </style>
+</head>
+<body>
+  <h1>Canva 批量字号</h1>
+
+  <div class="warn">⚠️ 会修改当前设计。建议先复制一份设计再运行；改完用 Cmd+Z 可逐步撤销。</div>
+
+  <div class="row" style="display:flex;align-items:center;gap:6px;">
+    <input type="checkbox" id="currentOnly" />
+    <label for="currentOnly" style="display:inline;margin:0;font-size:13px;color:#1a1a2e;cursor:pointer;">仅当前页（不勾选 = 所有页面）</label>
+  </div>
+
+  <div class="row">
+    <label for="size">目标字号（所有字幕统一设为）</label>
+    <input type="number" id="size" min="1" max="800" value="56" />
+  </div>
+
+  <div class="row">
+    <label for="threshold">只改原字号 ≥ 此值的文字（跳过小水印）</label>
+    <input type="number" id="threshold" min="1" max="800" value="30" />
+    <div class="hint">例如阈值 30：会改 56 号的字幕，跳过 24 号的「AI generated video」水印。</div>
+  </div>
+
+  <button id="run">应用到所有页面</button>
+
+  <hr />
+
+  <div class="section-title">字幕位置统一</div>
+  <div class="row">
+    <div class="hint" style="margin-bottom:8px;">先在 Canva 里手动调好一页字幕的位置，点「读取」获取坐标，再「应用」到其他页。</div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <label style="display:inline;margin:0;white-space:nowrap;">X</label>
+      <input type="text" id="posX" style="width:80px;text-transform:none;" placeholder="px" />
+      <label style="display:inline;margin:0;white-space:nowrap;">Y</label>
+      <input type="text" id="posY" style="width:80px;text-transform:none;" placeholder="px" />
+      <button id="readPos" style="width:auto;padding:8px 12px;font-size:12px;white-space:nowrap;">读取当前页</button>
+    </div>
+  </div>
+  <button id="applyPos">应用位置到所有页面</button>
+
+  <hr />
+
+  <div class="section-title">批量添加空白页</div>
+  <div class="row">
+    <label for="pageCount">添加页数</label>
+    <input type="number" id="pageCount" min="1" max="200" value="5" />
+  </div>
+  <button id="runAddPages">添加空白页</button>
+
+  <hr />
+
+  <div class="section-title">把 Uploads 文件夹的视频放到各页</div>
+  <div class="row">
+    <div class="hint" style="margin-bottom:8px;">先把视频传进 Canva Uploads 的某个<b>文件夹（Folders）</b>；填该文件夹名称，插件会把里面的<b>视频</b>逐个新建页放置（只放视频，跳过图片）。</div>
+    <label for="videoFolderName">Uploads 文件夹名称</label>
+    <input type="text" id="videoFolderName" placeholder="如：0525许诺-少数民族年轻女" style="text-transform:none;" />
+  </div>
+  <button id="runUploadVideos">放置该文件夹的视频到各页</button>
+
+  <hr />
+
+  <div class="section-title">字幕高亮动画（Highlight）</div>
+  <div class="row">
+    <label for="colorHex">高亮颜色（应用到所有页字幕）</label>
+    <div class="color-row">
+      <input type="color" id="color" value="#0CC0DF" />
+      <input type="text" id="colorHex" value="#0CC0DF" maxlength="7" placeholder="#0CC0DF" />
+    </div>
+    <div class="hint">会逐页给字幕套用 Highlight 动画并设为该颜色；非字幕文字（如水印）自动跳过。</div>
+  </div>
+  <button id="runAnimate">应用高亮动画到所有页面</button>
+
+  <hr />
+
+  <div class="section-title">字幕文本校对（AI）</div>
+  <div class="row">
+    <label for="proofRules">校对规则（可自定义，修改后自动保存）</label>
+    <textarea id="proofRules" rows="8">1. Capitalization: Capitalize the first word of each sentence and all proper nouns. Fix words the auto-caption wrongly lower-cased or upper-cased. Do NOT change the words themselves.
+
+2. Christian Terminology (main focus — auto-caption often lower-cases these):
+   - Capitalize sacred titles and proper nouns: God, the Lord, Christ, Jesus, the Holy Spirit, the Father, the Son, the Savior, the Redeemer, the Almighty.
+   - Pronouns He, Him, His, Himself: capitalize ONLY when they refer to God, Jesus, the Lord, or the Holy Spirit. When a pronoun refers to a human (or anyone other than God), keep it lowercase — EXCEPT when it is the first word of a sentence (normal sentence-start capitalization).
+   - Capitalize "Scripture(s)", "the Word" (the Bible / Jesus as the Logos), "the Gospel", "the Cross", "the Kingdom" (of God/Heaven), "the Church" (body of Christ).
+   - Preserve standard biblical book names (Genesis, Psalms, Romans, etc.).
+
+3. Punctuation: Fix punctuation within each card — commas, periods, question/exclamation marks, and possessive/contraction apostrophes (e.g. "Johns" → "John's", "dont" → "don't"). Do NOT move text between cards.</textarea>
+    <div class="hint">以上规则会随校对请求发给 AI；可根据项目需要自由编辑。</div>
+    <button id="resetRules" class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px;margin-top:6px;">恢复默认规则</button>
+  </div>
+  <div class="row">
+    <label for="provider">校对后端</label>
+    <select id="provider" style="text-transform:none;">
+      <option value="gemini">Gemini AI Studio</option>
+      <option value="openrouter">OpenRouter</option>
+      <option value="local">本机代理（localhost:8787）</option>
+    </select>
+  </div>
+  <div class="row" id="apiKeyRow">
+    <label for="apiKey">API Key</label>
+    <div class="key-row">
+      <input type="password" id="apiKey" class="api-key-input" placeholder="AIza... / sk-or-..." />
+      <button id="saveKey" style="width:auto;padding:8px 14px;font-size:12px;">保存</button>
+    </div>
+    <div class="hint" id="apiKeyHint"></div>
+  </div>
+  <div class="row" id="orFreeRow" style="display:none;">
+    <label for="orFreeModel">OpenRouter 免费模型</label>
+    <div class="key-row">
+      <select id="orFreeModel" style="text-transform:none;flex:1;"><option value="">— 选择免费模型 —</option></select>
+      <button id="refreshModels" style="width:auto;padding:8px 14px;font-size:12px;">刷新</button>
+    </div>
+    <div class="hint" id="orFreeHint">实时拉取自 openrouter.ai；免费模型随时可能变动。</div>
+  </div>
+  <div class="row" id="geminiRow" style="display:none;">
+    <label for="geminiModel">Gemini 模型</label>
+    <div class="key-row">
+      <select id="geminiModel" style="text-transform:none;flex:1;"><option value="">— 选择模型 —</option></select>
+      <button id="refreshGeminiModels" style="width:auto;padding:8px 14px;font-size:12px;">刷新</button>
+    </div>
+    <div class="hint" id="geminiHint">按你的 key 实时拉取；需先填写 key 后点刷新。</div>
+  </div>
+  <div class="row" id="modelRow">
+    <label for="model">模型（留空用默认）</label>
+    <input type="text" id="model" style="text-transform:none;" placeholder="" />
+    <div class="hint" id="modelHint"></div>
+  </div>
+  <button id="runProofread">开始校对</button>
+  <div id="proofLog"></div>
+  <button id="applyCorrections" class="btn-secondary" disabled>应用修正</button>
+
+  <div id="status"></div>
+  <div id="log"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
