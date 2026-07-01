@@ -1,44 +1,44 @@
 # Canva 批量字号
 
-A Chrome extension that batch-applies font size, position, highlight animation, and AI-powered caption proofreading to Canva designs — across all pages in one click.
+一键批量调整 Canva 设计中所有页面的字幕字号、位置、高亮动画，并支持 AI 字幕校对。
 
-## Features
+## 功能
 
-- **Batch font size** — Set all caption text to a target size; skip small watermark text via a threshold
-- **Caption position** — Read position from one page and apply uniformly to all pages
-- **Highlight animation** — Apply Canva's Highlight animation with a custom color to all caption elements
-- **AI proofreading** — Extract captions via the Transcript panel and fix capitalization/punctuation with Gemini or OpenRouter
-- **Batch page creation** — Add multiple blank pages at once
-- **Video placement** — Place videos from an Uploads folder onto new pages sequentially
+- **批量字号** — 将所有字幕统一设为目标字号，通过阈值自动跳过小号水印文字
+- **字幕位置统一** — 读取当前页字幕坐标，一键应用到所有页面
+- **高亮动画** — 为所有页面字幕批量套用 Canva Highlight 动画并设定自定义颜色
+- **AI 字幕校对** — 通过转录面板提取全部字幕，调用 Gemini 或 OpenRouter 自动修正大小写与标点
+- **批量添加空白页** — 一次性添加多个空白页
+- **视频批量放置** — 将 Uploads 文件夹内的视频逐个新建页放置到设计中
 
-## Installation
+## 安装方法
 
-1. Download the latest release zip from the [Releases](../../releases) page
-2. Unzip the file
-3. Open Chrome → `chrome://extensions/` → enable **Developer mode**
-4. Click **Load unpacked** and select the unzipped folder
+1. 前往 [Releases](../../releases) 页面下载最新版 zip 包
+2. 解压缩
+3. 打开 Chrome，进入 `chrome://extensions/`，开启右上角**开发者模式**
+4. 点击**加载已解压的扩展程序**，选择解压后的文件夹
 
-## Usage
+## 使用方法
 
-1. Open a design in Canva (`canva.com/design/…`)
-2. Click the extension icon to open the side panel
-3. Set your target font size and threshold, then click **应用到所有页面**
+1. 在 Canva 中打开任意设计（`canva.com/design/…`）
+2. 点击扩展图标，打开侧边栏
+3. 设置目标字号与阈值，点击**应用到所有页面**
 
-## Release
+## 版本发布
 
-Latest release: [v1.0.0](../../releases/tag/v1.0.0)
+最新版本：[v1.0.0](../../releases/tag/v1.0.0)
 
-Releases are built automatically via GitHub Actions on each version tag push. The release asset is a zip package ready for Chrome's "Load unpacked" installer.
+每次推送版本标签后，GitHub Actions 自动构建并生成可直接加载的 zip 安装包。
 
-## Permissions
+## 权限说明
 
-| Permission | Reason |
-|-----------|--------|
-| `debugger` | Send trusted input events to Canva canvas |
-| `tabs` | Detect active Canva tab |
-| `storage` | Persist API keys and settings |
-| `sidePanel` | Render the control panel as a Chrome side panel |
+| 权限 | 用途 |
+|------|------|
+| `debugger` | 向 Canva 画布发送可信输入事件 |
+| `tabs` | 检测当前活动的 Canva 标签页 |
+| `storage` | 持久化保存 API Key 及用户设置 |
+| `sidePanel` | 以 Chrome 侧边栏形式渲染控制面板 |
 
-## License
+## 开源协议
 
 MIT
