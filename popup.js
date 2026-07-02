@@ -26,6 +26,45 @@ const geminiModelEl = document.getElementById("geminiModel");
 const refreshGeminiBtn = document.getElementById("refreshGeminiModels");
 const geminiHint = document.getElementById("geminiHint");
 
+// —— 更新检查 ——
+// 发新版时只需改仓库根目录 version.json 的 version/downloadUrl/notes 并推送。
+const VERSION_JSON_URL = "https://raw.githubusercontent.com/stevenpcny/canva-font-plugin/main/version.json";
+
+// 语义化版本比较：a>b 返回 1，a<b 返回 -1，相等返回 0。
+function compareVersions(a, b) {
+  const pa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).split(".").map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
+async function checkForUpdate() {
+  const banner = document.getElementById("updateBanner");
+  if (!banner) return;
+  try {
+    const res = await fetch(VERSION_JSON_URL, { cache: "no-store" });
+    if (!res.ok) return;
+    const remote = await res.json();
+    const current = chrome.runtime.getManifest().version;
+    if (!remote.version || compareVersions(remote.version, current) <= 0) return;
+
+    document.getElementById("updateLatest").textContent = "v" + remote.version;
+    document.getElementById("updateNotes").textContent = remote.notes ? "：" + remote.notes + " " : " ";
+    const link = document.getElementById("updateLink");
+    const url = remote.downloadUrl || "https://github.com/stevenpcny/canva-font-plugin/releases/latest";
+    link.onclick = (e) => { e.preventDefault(); chrome.tabs.create({ url }); };
+    banner.style.display = "block";
+  } catch (_) {
+    // 网络失败静默忽略，不打扰用户
+  }
+}
+checkForUpdate();
+
 const OR_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const MODELS_CACHE_TTL = 6 * 60 * 60 * 1000; // 模型列表缓存 6 小时
