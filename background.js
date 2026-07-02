@@ -400,14 +400,10 @@ function makeRunner(tabId, port, state) {
           send("status", { text: `第 ${i} / ${total} 页…` });
 
           if (allPages) {
-            const thumb = await getPageThumbRect(i);
-            if (thumb) {
-              await clickAt(thumb.cx, thumb.cy);
-              for (let t = 0; t < 20; t++) {
-                await sleep(150);
-                const pi = await readPageInfo();
-                if (pi && pi.current === i) break;
-              }
+            if (!(await navigateToPage(i))) {
+              log(`  ✗ 第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图），跳过`);
+              errors++;
+              continue;
             }
           }
           await sleep(400);
@@ -492,14 +488,10 @@ function makeRunner(tabId, port, state) {
           send("status", { text: `第 ${i} / ${total} 页…` });
 
           if (allPages) {
-            const thumb = await getPageThumbRect(i);
-            if (thumb) {
-              await clickAt(thumb.cx, thumb.cy);
-              for (let t = 0; t < 20; t++) {
-                await sleep(150);
-                const pi = await readPageInfo();
-                if (pi && pi.current === i) break;
-              }
+            if (!(await navigateToPage(i))) {
+              log(`  ✗ 第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图），跳过`);
+              errors++;
+              continue;
             }
           }
           await sleep(400);
@@ -814,18 +806,30 @@ ${lines}`;
     return true;
   }
 
-  // 翻到指定页（复用自 run/runAnimate 的翻页逻辑）
+  // 翻到指定页（run/runAnimate/runSetPosition 的 allPages 缩略图分支共用）。
+  // Duration 时间轴视图下 readPageInfo() 仍返回 "N/M"（会被误判成经典设计、走缩略图分支），
+  // 但此视图没有页面缩略图 [aria-label="Page i"] → 旧代码 if(thumb) 静默跳过 → 每页都在当前
+  // 那一页上操作 → 只有 1 页被应用。这里缩略图缺失时先点底部 "Pages" 切到缩略图条视图再翻页；
+  // 仍找不到才返回 false（改为显式失败，不再静默）。见 arch_decisions #14。
   async function navigateToPage(i) {
-    const thumb = await getPageThumbRect(i);
-    if (thumb) {
-      await clickAt(thumb.cx, thumb.cy);
-      for (let t = 0; t < 20; t++) {
-        await sleep(150);
-        const pi = await readPageInfo();
-        if (pi && pi.current === i) break;
+    let thumb = await getPageThumbRect(i);
+    if (!thumb) {
+      const toggle = await findPagesViewToggle();
+      if (toggle) {
+        await clickAt(toggle.cx, toggle.cy);
+        await sleep(600);
+        thumb = await getPageThumbRect(i);
       }
     }
+    if (!thumb) return false;
+    await clickAt(thumb.cx, thumb.cy);
+    for (let t = 0; t < 20; t++) {
+      await sleep(150);
+      const pi = await readPageInfo();
+      if (pi && pi.current === i) break;
+    }
     await sleep(400);
+    return true;
   }
 
   async function runProofread(cfg, allPages, rules) {
@@ -1396,7 +1400,13 @@ ${lines}`;
           if (state.cancelled) break;
           send("status", { text: `第 ${i} / ${total} 页…` });
 
-          if (allPages) await navigateToPage(i);
+          if (allPages) {
+            if (!(await navigateToPage(i))) {
+              log(`  ✗ 第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图），跳过`);
+              errors++;
+              continue;
+            }
+          }
           await sleep(400);
 
           const r = await adjustCurrentPagePosition(`第 ${i} 页`, x, y);
