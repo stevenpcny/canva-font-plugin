@@ -1,5 +1,6 @@
 {
   "version": "1.0.2",
+  "minVersion": "1.0.0",
   "downloadUrl": "https://github.com/stevenpcny/canva-font-plugin/releases/latest",
   "notes": "最新版本。"
 }

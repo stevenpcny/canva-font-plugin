@@ -67,6 +67,12 @@
   </style>
 </head>
 <body>
+  <div id="lockOverlay" style="display:none;position:fixed;inset:0;z-index:9999;background:#fff;padding:24px 20px;box-sizing:border-box;">
+    <div style="font-size:15px;font-weight:600;margin-bottom:10px;color:#b91c1c;">⛔ 版本过旧，无法使用</div>
+    <div id="lockMsg" style="font-size:12px;color:#555;line-height:1.6;margin-bottom:16px;"></div>
+    <button id="lockDownloadBtn" style="width:100%;padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:14px;font-weight:600;cursor:pointer;">前往下载最新版</button>
+  </div>
+
   <h1>Canva 批量字号</h1>
 
   <div id="updateBanner" style="display:none;font-size:12px;color:#5b21b6;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:8px 10px;margin-bottom:12px;line-height:1.5;">

@@ -43,24 +43,71 @@ function compareVersions(a, b) {
   return 0;
 }
 
-async function checkForUpdate() {
+const DEFAULT_DOWNLOAD_URL = "https://github.com/stevenpcny/canva-font-plugin/releases/latest";
+const GRACE_MS = 7 * 24 * 60 * 60 * 1000;          // 拉取失败后，用缓存判定的宽限期
+const FIRST_INSTALL_GRACE_MS = 24 * 60 * 60 * 1000; // 首装且从未成功拉取时的宽限期
+
+// 锁死插件：显示遮罩、禁用所有功能按钮。
+function lockPlugin(reason, downloadUrl) {
+  const overlay = document.getElementById("lockOverlay");
+  if (overlay) {
+    document.getElementById("lockMsg").textContent = reason;
+    document.getElementById("lockDownloadBtn").onclick = () =>
+      chrome.tabs.create({ url: downloadUrl || DEFAULT_DOWNLOAD_URL });
+    overlay.style.display = "block";
+  }
+  ["run", "runAddPages", "runUploadVideos", "runAnimate", "runProofread", "applyCorrections"]
+    .forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = true; });
+}
+
+function showUpdateBanner(latest, notes, downloadUrl) {
   const banner = document.getElementById("updateBanner");
   if (!banner) return;
+  document.getElementById("updateLatest").textContent = "v" + latest;
+  document.getElementById("updateNotes").textContent = notes ? "：" + notes + " " : " ";
+  document.getElementById("updateLink").onclick = (e) => {
+    e.preventDefault();
+    chrome.tabs.create({ url: downloadUrl || DEFAULT_DOWNLOAD_URL });
+  };
+  banner.style.display = "block";
+}
+
+async function checkForUpdate() {
+  const current = chrome.runtime.getManifest().version;
+  const now = Date.now();
   try {
     const res = await fetch(VERSION_JSON_URL, { cache: "no-store" });
-    if (!res.ok) return;
+    if (!res.ok) throw new Error("HTTP " + res.status);
     const remote = await res.json();
-    const current = chrome.runtime.getManifest().version;
-    if (!remote.version || compareVersions(remote.version, current) <= 0) return;
 
-    document.getElementById("updateLatest").textContent = "v" + remote.version;
-    document.getElementById("updateNotes").textContent = remote.notes ? "：" + remote.notes + " " : " ";
-    const link = document.getElementById("updateLink");
-    const url = remote.downloadUrl || "https://github.com/stevenpcny/canva-font-plugin/releases/latest";
-    link.onclick = (e) => { e.preventDefault(); chrome.tabs.create({ url }); };
-    banner.style.display = "block";
+    // 成功拉取：缓存本次结果，供离线时判定
+    await chrome.storage.local.set({ updateCache: { minVersion: remote.minVersion || "0.0.0", downloadUrl: remote.downloadUrl || DEFAULT_DOWNLOAD_URL, ts: now } });
+
+    if (remote.minVersion && compareVersions(current, remote.minVersion) < 0) {
+      lockPlugin(`当前版本 v${current} 过旧，需升级到 v${remote.minVersion} 或更高才能继续使用。`, remote.downloadUrl);
+      return;
+    }
+    if (remote.version && compareVersions(remote.version, current) > 0) {
+      showUpdateBanner(remote.version, remote.notes, remote.downloadUrl);
+    }
   } catch (_) {
-    // 网络失败静默忽略，不打扰用户
+    // —— 拉取失败：带宽限期的 fail-closed ——
+    const { updateCache, firstSeen } = await chrome.storage.local.get(["updateCache", "firstSeen"]);
+    if (updateCache) {
+      // 已知旧版直接锁；否则在宽限期内放行，超期则锁
+      if (compareVersions(current, updateCache.minVersion) < 0) {
+        lockPlugin(`当前版本 v${current} 过旧，需升级到 v${updateCache.minVersion} 或更高。`, updateCache.downloadUrl);
+      } else if (now - updateCache.ts > GRACE_MS) {
+        lockPlugin("已超过 7 天无法连接更新服务器，无法校验版本。请联网后重新打开，或前往下载最新版。", updateCache.downloadUrl);
+      }
+    } else {
+      // 从未成功拉取过（多为首装离线）：记录首次时间，给 24 小时宽限
+      if (!firstSeen) {
+        await chrome.storage.local.set({ firstSeen: now });
+      } else if (now - firstSeen > FIRST_INSTALL_GRACE_MS) {
+        lockPlugin("首次使用需联网校验版本，但一直无法连接更新服务器。请联网后重新打开。", DEFAULT_DOWNLOAD_URL);
+      }
+    }
   }
 }
 checkForUpdate();
