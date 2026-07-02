@@ -106,10 +106,11 @@ function makeRunner(tabId, port, state) {
   }
 
   // 底部控制条上的 "Pages" 视图切换按钮（纯文本、无 aria-label，与 Zoom 滑块同排）
+  // 中文界面实测文本为 "页面"，非直译，需双语候选匹配
   function findPagesViewToggle() {
     return evaluate(`(() => {
       const el = [...document.querySelectorAll('button,div[role="button"]')]
-        .find(e => (e.textContent||'').trim() === 'Pages' && e.getBoundingClientRect().top > innerHeight - 100);
+        .find(e => ['Pages','页面'].includes((e.textContent||'').trim()) && e.getBoundingClientRect().top > innerHeight - 100);
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
@@ -137,16 +138,28 @@ function makeRunner(tabId, port, state) {
     return info;
   }
 
-  // 画布矩形获取表达式：role/aria-label 语义属性比混淆 class 稳定，但该节点自身 rect 恒为 0x0
-  // （它是 Canva 的无障碍镜像树节点，不是可视渲染树的一部分），必须沿祖先链上找第一个有真实尺寸的祖先才是可视画布框。
-  // .jXCxjw 混淆 class 会随 Canva 构建变化而失效（2026-07 曾出现指向无关缩略图导致文字枚举全部清空），降级为兜底。
+  // 画布矩形获取表达式：aria-label="Canvas content" 是英文硬编码，中文界面实测为
+  // "画布内容"，且页面上可能存在多个 [role="application"]（含 aria-label 为空的无关节点）。
+  // 改用几何启发式，完全不依赖 aria-label 文本：枚举全部 [role="application"]，各自沿
+  // 祖先链找第一个有真实尺寸(w>5&&h>5)的祖先（该角色节点自身 rect 恒为 0x0，是无障碍镜像
+  // 树节点，不在可视渲染树里），取面积最大的一个即为真实画布框。已在中英文两套真实设计上
+  // 验证一致。.jXCxjw 混淆 class 会随 Canva 构建变化而失效（且实测在不同设计间行为不稳定，
+  // 曾指向无关缩略图导致文字枚举全部清空），仅作最后兜底。
   const CANVAS_FRAME_EXPR = `(() => {
-    let el = document.querySelector('[role="application"][aria-label="Canvas content"]');
-    for (let i = 0; el && i < 8; i++) {
-      const rr = el.getBoundingClientRect();
-      if (rr.width > 5 && rr.height > 5) return rr;
-      el = el.parentElement;
+    let best = null, bestArea = 0;
+    for (const app of document.querySelectorAll('[role="application"]')) {
+      let el = app;
+      for (let i = 0; el && i < 8; i++) {
+        const rr = el.getBoundingClientRect();
+        if (rr.width > 5 && rr.height > 5) {
+          const area = rr.width * rr.height;
+          if (area > bestArea) { bestArea = area; best = rr; }
+          break;
+        }
+        el = el.parentElement;
+      }
     }
+    if (best) return best;
     const legacy = document.querySelector('.jXCxjw');
     return legacy ? legacy.getBoundingClientRect() : null;
   })()`;
@@ -165,9 +178,10 @@ function makeRunner(tabId, port, state) {
 
   // 取第 i 页缩略图中心坐标（先滚动到可见）
   // 注意：aria-label="Page N" 可能同时命中无障碍镜像树的折叠节点（rect 恒为 0），必须限定 role=button 取真实缩略图。
+  // 中文界面实测格式为 "第N页"（无空格，非简单替换），需双语候选。
   function getPageThumbRect(i) {
     return evaluate(`(() => {
-      const el = [...document.querySelectorAll('[aria-label="Page ${i}"]')].find(e => e.getAttribute('role') === 'button');
+      const el = [...document.querySelectorAll('[aria-label="Page ${i}"], [aria-label="第${i}页"]')].find(e => e.getAttribute('role') === 'button');
       if (!el) return null;
       el.scrollIntoView({ block: 'nearest', inline: 'center' });
       const r = el.getBoundingClientRect();
@@ -208,9 +222,10 @@ function makeRunner(tabId, port, state) {
   }
 
   // 读当前选中元素的字号框状态
+  // 中文界面实测 aria-label 为 "字体大小"
   function readFontField() {
     return evaluate(`(() => {
-      const fi = document.querySelector('input[aria-label="Font size"]');
+      const fi = document.querySelector('input[aria-label="Font size"], input[aria-label="字体大小"]');
       if (!fi) return { present: false };
       const r = fi.getBoundingClientRect();
       return {
@@ -226,7 +241,7 @@ function makeRunner(tabId, port, state) {
   // 选中字号框里的全部文字（选择操作不受信任限制，仅值变更需要可信事件）
   function selectFontFieldAll() {
     return evaluate(`(() => {
-      const fi = document.querySelector('input[aria-label="Font size"]');
+      const fi = document.querySelector('input[aria-label="Font size"], input[aria-label="字体大小"]');
       if (fi) { fi.focus(); fi.select(); return true; }
       return false;
     })()`);
@@ -262,9 +277,12 @@ function makeRunner(tabId, port, state) {
 
   // —— 高亮动画相关 ——
 
-  function findByAria(label) {
+  // label 支持传入候选数组（中英双语），依次尝试直到命中
+  function findByAria(labelOrList) {
+    const labels = Array.isArray(labelOrList) ? labelOrList : [labelOrList];
+    const selector = labels.map(l => `button[aria-label=${JSON.stringify(l)}]`).join(', ');
     return evaluate(`(() => {
-      const b = document.querySelector('button[aria-label=${JSON.stringify(label)}]');
+      const b = document.querySelector(${JSON.stringify(selector)});
       if (!b) return null;
       const r = b.getBoundingClientRect();
       return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
@@ -272,10 +290,11 @@ function makeRunner(tabId, port, state) {
   }
 
   // Captions 区的 Highlight 开关（存在即说明选中的是字幕）
+  // 中文界面实测该动效预设名为 "强调"（Canva 翻译选择，非字面直译，非常规词典可猜）
   function readHighlightSwitch() {
     return evaluate(`(() => {
       const b = [...document.querySelectorAll('button[role="switch"]')]
-        .find(x => (x.textContent||'').trim() === 'Highlight');
+        .find(x => ['Highlight','强调'].includes((x.textContent||'').trim()));
       if (!b) return { present: false };
       const r = b.getBoundingClientRect();
       return {
@@ -287,9 +306,10 @@ function makeRunner(tabId, port, state) {
     })()`);
   }
 
+  // 中文界面实测 aria-label 为 "十六进制颜色代码"
   function focusHexInput() {
     return evaluate(`(() => {
-      const fi = document.querySelector('input[aria-label="Hex color code"]');
+      const fi = document.querySelector('input[aria-label="Hex color code"], input[aria-label="十六进制颜色代码"]');
       if (!fi) return false;
       fi.focus(); fi.select();
       return true;
@@ -298,7 +318,7 @@ function makeRunner(tabId, port, state) {
 
   function readHexInput() {
     return evaluate(`(() => {
-      const fi = document.querySelector('input[aria-label="Hex color code"]');
+      const fi = document.querySelector('input[aria-label="Hex color code"], input[aria-label="十六进制颜色代码"]');
       return fi ? fi.value : null;
     })()`);
   }
@@ -308,7 +328,7 @@ function makeRunner(tabId, port, state) {
     // 若动画面板未显示 Highlight，则点 Animate 打开
     let hl = await readHighlightSwitch();
     if (!hl.present) {
-      const ab = await findByAria("Animate");
+      const ab = await findByAria(["Animate", "动效"]);
       if (!ab) return { applied: false, reason: "no-animate-btn" };
       await clickAt(ab.cx, ab.cy);
       await sleep(700);
@@ -323,12 +343,12 @@ function makeRunner(tabId, port, state) {
     }
 
     // 打开取色 → 新增自定义色 → 填 hex
-    const cb = await findByAria("Color");
+    const cb = await findByAria(["Color", "颜色"]);
     if (!cb) return { applied: false, reason: "no-color-btn" };
     await clickAt(cb.cx, cb.cy);
     await sleep(600);
 
-    const add = await findByAria("Add a new color");
+    const add = await findByAria(["Add a new color", "添加新颜色"]);
     if (!add) return { applied: false, reason: "no-add-color" };
     await clickAt(add.cx, add.cy);
     await sleep(600);
@@ -957,8 +977,9 @@ ${lines}`;
         if (state.cancelled) break;
         send("status", { text: `添加第 ${i + 1} / ${count} 页…` });
         // 找末尾的大号 "Add page" 按钮（最后一个），滚动到可见后点击
+        // 中文界面实测 aria-label 为 "添加页面"
         const btn = await evaluate(`(() => {
-          const all = [...document.querySelectorAll('button[aria-label="Add page"]')];
+          const all = [...document.querySelectorAll('button[aria-label="Add page"], button[aria-label="添加页面"]')];
           const b = all[all.length - 1];
           if (!b) return null;
           b.scrollIntoView({ block: 'nearest', inline: 'center' });
@@ -989,16 +1010,19 @@ ${lines}`;
   // —— 批量上传视频到各页 ——
 
   // 打开 Uploads 侧边栏（如果还没打开）
+  // 中文界面实测 tab 文本为 "上传"；子标签(图片/视频/音频/设计/文件夹)的 textContent
+  // 实测是重复拼接的（如 "文件夹文件夹" 而非 "文件夹"，疑似无障碍镜像文本+可见文本被
+  // 一起计入），故统一改用 includes() 子串匹配而非精确相等，中英文候选都覆盖。
   async function openUploadsPanel() {
     const already = await evaluate(`(() => {
       const panel = document.querySelector('[role="tabpanel"][aria-label="Uploads"], [role="tabpanel"]');
       // 检查 Uploads tab 是否 selected
-      const tab = [...document.querySelectorAll('[role="tab"]')].find(t => (t.textContent||'').trim() === 'Uploads');
+      const tab = [...document.querySelectorAll('[role="tab"]')].find(t => { const s = (t.textContent||'').trim(); return s.includes('Uploads') || s.includes('上传'); });
       return tab ? tab.getAttribute('aria-selected') === 'true' : false;
     })()`);
     if (already) return;
     const btn = await evaluate(`(() => {
-      const tab = [...document.querySelectorAll('[role="tab"]')].find(t => (t.textContent||'').trim() === 'Uploads');
+      const tab = [...document.querySelectorAll('[role="tab"]')].find(t => { const s = (t.textContent||'').trim(); return s.includes('Uploads') || s.includes('上传'); });
       if (!tab) return null;
       const r = tab.getBoundingClientRect();
       return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
@@ -1013,7 +1037,7 @@ ${lines}`;
   async function switchToFoldersTab() {
     const btn = await evaluate(`(() => {
       const ft = [...document.querySelectorAll('[role="tab"]')]
-        .find(t => (t.textContent||'').trim() === 'Folders');
+        .find(t => { const s = (t.textContent||'').trim(); return s.includes('Folders') || s.includes('文件夹'); });
       if (!ft) return null;
       const r = ft.getBoundingClientRect();
       return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
@@ -1076,7 +1100,7 @@ ${lines}`;
     const beforeTotal = before ? before.total : 0;
     // 点击末尾 "Add page" 按钮
     const btn = await evaluate(`(() => {
-      const all = [...document.querySelectorAll('button[aria-label="Add page"]')];
+      const all = [...document.querySelectorAll('button[aria-label="Add page"], button[aria-label="添加页面"]')];
       const b = all[all.length - 1];
       if (!b) return null;
       b.scrollIntoView({ block: 'nearest', inline: 'center' });
@@ -1194,21 +1218,13 @@ ${lines}`;
 
   // —— 字幕位置统一 ——
 
-  // 打开 Position 面板（工具栏 "..." → "Position"）
+  // 打开 Position 面板（顶部文字工具栏的常驻按钮，和 Effects/Animate 同排；
+  // 实测它不在 "..." More 下拉菜单里——More 是选中元素浮动工具栏上的另一个按钮，
+  // 下拉内容只有复制/粘贴/对齐/锁定/删除等，跟 Position 无关，点它对本流程无意义。
+  // 中文界面实测该按钮文本为 "调整图层" 且没有 aria-label（Canva 翻译选择，非字面直译）。
   async function openPositionPanel() {
-    const moreBtn = await evaluate(`(() => {
-      const b = document.querySelector('button[aria-label="More"]') ||
-                document.querySelector('button[aria-label="Open more controls for selected element"]');
-      if (!b) return null;
-      const r = b.getBoundingClientRect();
-      return r.width > 0 ? { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) } : null;
-    })()`);
-    if (!moreBtn) throw new Error("找不到工具栏 '...' 按钮");
-    await clickAt(moreBtn.cx, moreBtn.cy);
-    await sleep(500);
-
     const posBtn = await evaluate(`(() => {
-      const b = [...document.querySelectorAll('button')].find(x => (x.textContent||'').trim() === 'Position');
+      const b = [...document.querySelectorAll('button')].find(x => ['Position','调整图层'].includes((x.textContent||'').trim()));
       if (!b) return null;
       const r = b.getBoundingClientRect();
       return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
