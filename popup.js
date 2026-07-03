@@ -416,11 +416,29 @@ function esc(s) {
 
 // —— 按钮事件 ——
 
+const splitModeEl = document.getElementById("splitMode");
+splitModeEl.addEventListener("change", () => {
+  document.getElementById("singleSizeRow").style.display = splitModeEl.checked ? "none" : "";
+  document.getElementById("splitRows").style.display = splitModeEl.checked ? "" : "none";
+});
+
 runBtn.addEventListener("click", async () => {
   const size = parseInt(document.getElementById("size").value, 10);
   const threshold = parseInt(document.getElementById("threshold").value, 10);
 
-  if (!size || size < 1 || size > 800) {
+  const valid = (n) => n >= 1 && n <= 800;
+  let split = null;
+  if (splitModeEl.checked) {
+    split = {
+      boundary: parseInt(document.getElementById("splitBoundary").value, 10),
+      titleSize: parseInt(document.getElementById("titleSize").value, 10),
+      bodySize: parseInt(document.getElementById("bodySize").value, 10),
+    };
+    if (!valid(split.boundary) || !valid(split.titleSize) || !valid(split.bodySize)) {
+      statusEl.textContent = "请输入有效的分界值/标题/正文字号（1–800）。";
+      return;
+    }
+  } else if (!valid(size)) {
     statusEl.textContent = "请输入有效的目标字号（1–800）。";
     return;
   }
@@ -429,7 +447,7 @@ runBtn.addEventListener("click", async () => {
   if (!tab) return;
 
   const allPages = !document.getElementById("currentOnly").checked;
-  startTask({ type: "run", tabId: tab.id, size, threshold, allPages });
+  startTask({ type: "run", tabId: tab.id, size, threshold, allPages, split });
 });
 
 runAddPagesBtn.addEventListener("click", async () => {

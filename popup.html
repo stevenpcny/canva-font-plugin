@@ -88,9 +88,32 @@
     <label for="currentOnly" style="display:inline;margin:0;font-size:13px;color:#1a1a2e;cursor:pointer;">仅当前页（不勾选 = 所有页面）</label>
   </div>
 
-  <div class="row">
+  <div class="row" style="display:flex;align-items:center;gap:6px;">
+    <input type="checkbox" id="splitMode" />
+    <label for="splitMode" style="display:inline;margin:0;font-size:13px;color:#1a1a2e;cursor:pointer;">标题/正文分开设置字号</label>
+  </div>
+
+  <div class="row" id="singleSizeRow">
     <label for="size">目标字号（所有字幕统一设为）</label>
     <input type="number" id="size" min="1" max="800" value="56" />
+  </div>
+
+  <div id="splitRows" style="display:none;">
+    <div class="row">
+      <label for="splitBoundary">分界字号（原字号 ≥ 此值算标题，否则算正文）</label>
+      <input type="number" id="splitBoundary" min="1" max="800" value="50" />
+    </div>
+    <div class="row" style="display:flex;gap:8px;">
+      <div style="flex:1;">
+        <label for="titleSize">标题改为</label>
+        <input type="number" id="titleSize" min="1" max="800" value="56" />
+      </div>
+      <div style="flex:1;">
+        <label for="bodySize">正文改为</label>
+        <input type="number" id="bodySize" min="1" max="800" value="42" />
+      </div>
+    </div>
+    <div class="hint" style="margin-top:-4px;margin-bottom:12px;">按选中后字号框里的真实字号分档（不受画布缩放影响）。已是目标字号的框会跳过。</div>
   </div>
 
   <div class="row">
@@ -118,12 +141,16 @@
 
   <hr />
 
-  <div class="section-title">批量添加空白页</div>
+  <div class="section-title">字幕高亮动画（Highlight）</div>
   <div class="row">
-    <label for="pageCount">添加页数</label>
-    <input type="number" id="pageCount" min="1" max="200" value="5" />
+    <label for="colorHex">高亮颜色（应用到所有页字幕）</label>
+    <div class="color-row">
+      <input type="color" id="color" value="#0CC0DF" />
+      <input type="text" id="colorHex" value="#0CC0DF" maxlength="7" placeholder="#0CC0DF" />
+    </div>
+    <div class="hint">会逐页给字幕套用 Highlight 动画并设为该颜色；非字幕文字（如水印）自动跳过。</div>
   </div>
-  <button id="runAddPages">添加空白页</button>
+  <button id="runAnimate">应用高亮动画到所有页面</button>
 
   <hr />
 
@@ -137,16 +164,12 @@
 
   <hr />
 
-  <div class="section-title">字幕高亮动画（Highlight）</div>
+  <div class="section-title">批量添加空白页</div>
   <div class="row">
-    <label for="colorHex">高亮颜色（应用到所有页字幕）</label>
-    <div class="color-row">
-      <input type="color" id="color" value="#0CC0DF" />
-      <input type="text" id="colorHex" value="#0CC0DF" maxlength="7" placeholder="#0CC0DF" />
-    </div>
-    <div class="hint">会逐页给字幕套用 Highlight 动画并设为该颜色；非字幕文字（如水印）自动跳过。</div>
+    <label for="pageCount">添加页数</label>
+    <input type="number" id="pageCount" min="1" max="200" value="5" />
   </div>
-  <button id="runAnimate">应用高亮动画到所有页面</button>
+  <button id="runAddPages">添加空白页</button>
 
   <hr />
 

@@ -446,7 +446,10 @@ function makeRunner(tabId, port, state) {
   }
 
   // 对当前渲染在画布上的这一页执行「枚举文字→逐个改字号」，返回本页统计
-  async function adjustCurrentPageTexts(pageLabel, size, threshold) {
+  // split（可选）：{ boundary, titleSize, bodySize }——按字号框真实值分档：
+  // >= boundary 视为标题改 titleSize，否则视为正文改 bodySize。
+  // 判断依据必须是字号框的值而非渲染 px（画布缩放会让两者不一致）。
+  async function adjustCurrentPageTexts(pageLabel, size, threshold, split) {
     let changed = 0, skipped = 0, errors = 0;
     const texts = await enumerateTexts();
     log(`${pageLabel}：发现 ${texts.length} 个文字元素。`);
@@ -465,9 +468,17 @@ function makeRunner(tabId, port, state) {
         skipped++;
         continue;
       }
-      const res = await setSizeForSelected(size);
+      const target = split
+        ? (f.value >= split.boundary ? split.titleSize : split.bodySize)
+        : size;
+      if (Math.round(f.value) === target) {
+        log(`  · 跳过「${t.text}」（已是目标字号 ${target}）`);
+        skipped++;
+        continue;
+      }
+      const res = await setSizeForSelected(target);
       if (res.applied) {
-        log(`  ✓ 「${t.text}」 ${f.value} → ${size}`);
+        log(`  ✓ 「${t.text}」 ${f.value} → ${target}${split ? (f.value >= split.boundary ? "（标题）" : "（正文）") : ""}`);
         changed++;
       } else {
         log(`  ✗ 「${t.text}」设置失败（结果 ${res.after}）`);
@@ -477,8 +488,145 @@ function makeRunner(tabId, port, state) {
     return { changed, skipped, errors };
   }
 
-  async function run(size, threshold, allPages) {
+  // 本页字幕段逐条经转录面板选中并设字号。
+  // 画布上同页多段字幕只有播放头当前时刻那条正常渲染，其余塌缩成 ~0 宽被
+  // enumerateTexts 的 10px 过滤挡掉（该过滤不能去掉，防假点击）——所以画布枚举
+  // 每页只能改到 1 段（用户反馈"每页只改第一条"的根因）。唯一可靠入口是
+  // Captions → Transcript 面板：点某行会定位播放头并选中该段（校对流程同款路径）。
+  // 时间轴分段条：每段字幕在画布下方有一个逐段小样，其 CSS font-size 与画布同基准，
+  // 是各段真实字号的可靠观测点（画布内塌缩副本的样式不可信，见 arch #21）
+  function readTimelineStripSizes() {
+    return evaluate(`(() => {
+      const frame = ${CANVAS_FRAME_EXPR};
+      if (!frame) return [];
+      const out = [];
+      for (const p of document.querySelectorAll('p')) {
+        const t = (p.textContent || '').trim();
+        if (!t) continue;
+        const r = p.getBoundingClientRect();
+        if (r.top <= frame.bottom) continue;
+        const fpx = parseFloat(getComputedStyle(p).fontSize);
+        if (!(fpx >= 20)) continue;
+        out.push({ key: t.toLowerCase().replace(/[^a-z0-9]/g, ''), px: fpx });
+      }
+      return out;
+    })()`);
+  }
+
+  async function adjustPageCaptionSegs(page, lines, size, threshold, split) {
     let changed = 0, skipped = 0, errors = 0;
+    log(`第 ${page} 页：转录面板字幕 ${lines.length} 段。`);
+
+    // 同组联动快速跳过：同一页字幕可能被合并成组（改一段全组生效），也可能一页多个组。
+    // 不猜组结构——改完一段后重读分段条，估算字号已到目标的段直接跳过；
+    // 估算失败/歧义/不等于目标一律走完整路径，误判方向只会多查不会漏改。
+    let pxPerUnit = null; // 渲染px / 字号值，来自完整路径读到的精确值对
+    let strip = null;
+    const stripValue = (text) => {
+      if (!pxPerUnit || !strip) return null;
+      const want = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (!want) return null;
+      const hits = strip.filter((s) => s.key === want || s.key.startsWith(want) || want.startsWith(s.key));
+      if (!hits.length) return null;
+      if (hits.some((h) => Math.abs(h.px - hits[0].px) > 0.5)) return null; // 跨页同文异号
+      return Math.round(hits[0].px / pxPerUnit);
+    };
+
+    for (const text of lines) {
+      if (state.cancelled) break;
+      const label = text.slice(0, 20);
+
+      const est = stripValue(text);
+      if (est != null) {
+        const estTarget = split ? (est >= split.boundary ? split.titleSize : split.bodySize) : size;
+        if (est === estTarget) {
+          log(`  · 跳过「${label}」（分段条显示已是 ${est}，同组联动）`);
+          skipped++;
+          continue;
+        }
+      }
+
+      if (!(await openCaptionsPanel())) {
+        log(`  ✗ 无法打开字幕面板，跳过「${label}」`);
+        errors++;
+        continue;
+      }
+      await sleep(250);
+      const line = await findTranscriptLine(page, text);
+      if (!line) {
+        log(`  ✗ 转录面板未找到「${label}」，跳过`);
+        errors++;
+        continue;
+      }
+      await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 选中该段
+      await sleep(600);
+      let f = await readFontField();
+      if (!f || !f.present || isNaN(f.value)) {
+        // 转录点击未带出字号框 → 在画布上点渲染出来的该段
+        const cap = await findRenderedCaption(text);
+        if (cap && cap.ok) {
+          await clickAt(cap.cx, cap.cy);
+          await sleep(300);
+          f = await readFontField();
+        }
+      }
+      if (!f || !f.present || isNaN(f.value)) {
+        log(`  ✗ 「${label}」未能选中，跳过`);
+        errors++;
+      } else if (f.value < threshold) {
+        log(`  · 跳过「${label}」（当前 ${f.value} < 阈值 ${threshold}）`);
+        skipped++;
+      } else {
+        // 用本段（真实字号, 分段条px）这对精确值标定换算系数
+        const stripNow = await readTimelineStripSizes();
+        const meKey = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const me = stripNow.find((s) => s.key === meKey || s.key.startsWith(meKey) || meKey.startsWith(s.key));
+        if (me && f.value > 0) { pxPerUnit = me.px / f.value; strip = stripNow; }
+
+        const target = split
+          ? (f.value >= split.boundary ? split.titleSize : split.bodySize)
+          : size;
+        if (Math.round(f.value) === target) {
+          log(`  · 跳过「${label}」（已是目标字号 ${target}）`);
+          skipped++;
+        } else {
+          const res = await setSizeForSelected(target);
+          if (res.applied) {
+            log(`  ✓ 「${label}」 ${f.value} → ${target}${split ? (f.value >= split.boundary ? "（标题）" : "（正文）") : ""}`);
+            changed++;
+            strip = await readTimelineStripSizes(); // 改动后重读，供后续段的同组联动判断
+          } else {
+            log(`  ✗ 「${label}」设置失败（结果 ${res.after}）`);
+            errors++;
+          }
+        }
+      }
+      await pressEscape();
+      await sleep(150);
+    }
+    return { changed, skipped, errors };
+  }
+
+  // 页号未知时（视频设计 readPageInfo 为 null 且仅当前页运行），
+  // 用画布上可见的字幕文本反查它属于转录面板的哪一页
+  async function findCurrentCaptionPage(captionsByPage) {
+    const texts = await enumerateTexts();
+    const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    for (const t of texts) {
+      const tn = norm(t.text); // 枚举文本截断到 24 字符 → 前缀匹配
+      if (!tn) continue;
+      for (const [pg, lines] of captionsByPage) {
+        if (lines.some((l) => norm(l).startsWith(tn))) return pg;
+      }
+    }
+    return null;
+  }
+
+  async function run(size, threshold, allPages, split) {
+    let changed = 0, skipped = 0, errors = 0;
+    const goalDesc = split
+      ? `标题(≥${split.boundary}) → ${split.titleSize}，正文 → ${split.bodySize}`
+      : `目标字号 ${size}`;
     try {
       await chrome.debugger.attach(target, "1.3");
       await cmd("Runtime.enable");
@@ -486,22 +634,45 @@ function makeRunner(tabId, port, state) {
 
       const info = await readPageInfo();
 
+      // 有原生字幕的设计：先读一次转录面板，拿到每页的全部字幕段。
+      // 读不到（经典无字幕设计）则 captionsByPage 为 null，后续流程与旧版完全一致。
+      let captionsByPage = null;
+      if (await openCaptionsPanel()) {
+        const transcript = await readCaptionsTranscript();
+        if (transcript.length) {
+          captionsByPage = new Map();
+          for (const t of transcript) {
+            if (!captionsByPage.has(t.page)) captionsByPage.set(t.page, []);
+            captionsByPage.get(t.page).push(t.text);
+          }
+        }
+      }
+
       if (allPages && !info) {
-        log(`目标字号 ${size}，阈值 ≥ ${threshold}。`);
-        const ok = await iterateVideoPagesViaCaptions(async (label) => {
-          const r = await adjustCurrentPageTexts(label, size, threshold);
-          changed += r.changed; skipped += r.skipped; errors += r.errors;
-        });
-        if (!ok) {
+        if (!captionsByPage) {
+          log("未能打开 Captions 转录面板，无法枚举全部页（当前设计可能没有 Canva 原生字幕）。");
           send("done", { ok: false });
           return;
+        }
+        const pages = [...captionsByPage.keys()].sort((a, b) => a - b);
+        log(`所有页（共 ${pages.length} 页，经字幕面板确认），${goalDesc}，阈值 ≥ ${threshold}。`);
+        for (const p of pages) {
+          if (state.cancelled) break;
+          send("status", { text: `第 ${p} / ${pages[pages.length - 1]} 页…` });
+          const s = await adjustPageCaptionSegs(p, captionsByPage.get(p), size, threshold, split);
+          changed += s.changed; skipped += s.skipped; errors += s.errors;
+          // 逐段点完后播放头已停在本页 → 再按画布枚举处理本页静态文字（标题/正文等）
+          const r = await adjustCurrentPageTexts(`第 ${p} 页（画布静态文字）`, size, threshold, split);
+          changed += r.changed; skipped += r.skipped; errors += r.errors;
+          await pressEscape();
+          await sleep(150);
         }
       } else {
         // 经典设计：有"当前/总页"文字，缩略图点击可正常翻页
         const total = info ? info.total : 1;
         const startPage = allPages ? 1 : (info ? info.current : 1);
         const endPage = allPages ? total : startPage;
-        log(`${allPages ? "所有" : "仅当前"}页（${startPage}–${endPage} / ${total}），目标字号 ${size}，阈值 ≥ ${threshold}。`);
+        log(`${allPages ? "所有" : "仅当前"}页（${startPage}–${endPage} / ${total}），${goalDesc}，阈值 ≥ ${threshold}。`);
 
         for (let i = startPage; i <= endPage; i++) {
           if (state.cancelled) break;
@@ -516,7 +687,17 @@ function makeRunner(tabId, port, state) {
           }
           await sleep(400);
 
-          const r = await adjustCurrentPageTexts(`第 ${i} 页`, size, threshold);
+          // 本页有字幕段则先经转录面板逐段补齐（Duration 视图等 info 可读的视频设计）
+          if (captionsByPage) {
+            let capPage = info && captionsByPage.has(i) ? i : null;
+            if (capPage == null) capPage = await findCurrentCaptionPage(captionsByPage);
+            if (capPage != null && captionsByPage.has(capPage)) {
+              const s = await adjustPageCaptionSegs(capPage, captionsByPage.get(capPage), size, threshold, split);
+              changed += s.changed; skipped += s.skipped; errors += s.errors;
+            }
+          }
+
+          const r = await adjustCurrentPageTexts(`第 ${i} 页${captionsByPage ? "（画布静态文字）" : ""}`, size, threshold, split);
           changed += r.changed; skipped += r.skipped; errors += r.errors;
           await pressEscape();
           await sleep(150);
@@ -1458,7 +1639,7 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener(async (msg) => {
     const runner = makeRunner(msg.tabId, port, state);
     const allPages = msg.allPages !== false;
-    if (msg.type === "run") await runner.run(msg.size, msg.threshold, allPages);
+    if (msg.type === "run") await runner.run(msg.size, msg.threshold, allPages, msg.split || null);
     else if (msg.type === "animate") await runner.runAnimate(msg.color, allPages);
     else if (msg.type === "proofread") await runner.runProofread({ provider: msg.provider, apiKey: msg.apiKey, model: msg.model }, allPages, msg.rules || "");
     else if (msg.type === "apply-corrections") await runner.runApplyCorrections(msg.corrections, allPages);

@@ -1,6 +1,6 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "minVersion": "1.0.0",
   "downloadUrl": "https://github.com/stevenpcny/canva-font-plugin/releases/latest",
-  "notes": "最新版本。"
+  "notes": "新增标题/正文分开设字号；修复视频页多段字幕只改第一段的 bug；同组字幕联动快速跳过提速。"
 }
