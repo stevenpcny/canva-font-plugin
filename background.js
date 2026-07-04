@@ -1275,6 +1275,51 @@ ${lines}`;
     })()`);
   }
 
+  // 面板列表是懒加载不是虚拟列表（2026-07 实测 106 项文件夹初始只挂 40 项，
+  // 滚到底全部挂载且滚出视口后不卸载）——枚举前滚到底直到瓦片数连续两轮不变。
+  // 滚动容器 = 左面板内唯一一个 宽 250~420、高 >300 且内容明显溢出的 div。
+  async function scrollPanelToBottom() {
+    let last = -1, stable = 0;
+    for (let i = 0; i < 20 && stable < 2; i++) {
+      const res = await evaluate(`(() => {
+        const sc = [...document.querySelectorAll('div')].find(el => {
+          const r = el.getBoundingClientRect();
+          return r.left < 100 && r.width > 250 && r.width < 420 && el.clientHeight > 300 && el.scrollHeight > el.clientHeight + 100;
+        });
+        if (sc) sc.scrollTop = sc.scrollHeight;
+        let count = 0;
+        for (const el of document.querySelectorAll('div[draggable="true"]')) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 30 && r.left < innerWidth * 0.4) count++;
+        }
+        return { count, hasScroller: !!sc };
+      })()`);
+      if (!res || !res.hasScroller) return;  // 列表未超一屏，已全量挂载
+      await sleep(900);
+      if (res.count === last) stable++; else { stable = 0; last = res.count; }
+    }
+  }
+
+  // 按枚举顺序取第 index 个视频瓦片的点击坐标；瓦片可能在视口外，
+  // 先 scrollIntoView 再取坐标（instant 滚动同步更新布局，一次 evaluate 即可）
+  async function getVideoTileRectByIndex(index) {
+    return evaluate(`(() => {
+      const vw = innerWidth;
+      const isDur = (el) => [...el.querySelectorAll('*')].some(c =>
+        c.children.length === 0 && /^\\d+(\\.\\d+)?s$/.test((c.textContent||'').trim()));
+      const tiles = [];
+      for (const el of document.querySelectorAll('div[draggable="true"]')) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 30 && r.height > 30 && r.left < vw * 0.4 && isDur(el)) tiles.push(el);
+      }
+      const el = tiles[${index}];
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center' });
+      const r = el.getBoundingClientRect();
+      return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
+    })()`);
+  }
+
   // 创建一个新页面并导航到它
   async function addOnePageAndNavigate() {
     const before = await readPageInfoRobust();
@@ -1306,8 +1351,13 @@ ${lines}`;
 
   // 进入指定 Folders 文件夹并枚举其中的视频项（只取含时长的视频，跳过图片）
   // 若当前面板已在该文件夹（有视频瓦片）则直接枚举，否则导航进入
-  async function enterFolderVideos(folderName) {
+  async function enterFolderVideos(folderName, expectedCount) {
     let vids = await getUploadedVideos();
+    if (vids.length > 0 && expectedCount && vids.length < expectedCount) {
+      // 面板被重挂载回懒加载初态（只挂了首屏），补滚一次
+      await scrollPanelToBottom();
+      vids = await getUploadedVideos();
+    }
     if (vids.length > 0) return vids;
     await openUploadsPanel();
     await sleep(300);
@@ -1316,6 +1366,7 @@ ${lines}`;
     const opened = await openFolderByName(folderName);
     if (!opened || !opened.found) return { error: opened ? opened.available : [] };
     await sleep(400);
+    await scrollPanelToBottom();
     return await getUploadedVideos();
   }
 
@@ -1339,6 +1390,7 @@ ${lines}`;
         return;
       }
 
+      await scrollPanelToBottom();
       const vids = await getUploadedVideos();
       if (vids.length === 0) {
         log(`文件夹「${folderName}」里没有视频（只放视频，图片会跳过）。`);
@@ -1364,18 +1416,20 @@ ${lines}`;
         }
 
         // 2. 确保仍在该文件夹视图（创建页可能改变面板），按索引取第 i 个
-        const cur = await enterFolderVideos(folderName);
+        const cur = await enterFolderVideos(folderName, count);
         if (cur && cur.error) {
           log(`  ✗ 无法回到文件夹「${folderName}」，中止剩余放置`);
           failed++;
           break;
         }
-        const vid = cur[i];
+        // 瓦片可能在视口外，取坐标前先 scrollIntoView
+        const vid = await getVideoTileRectByIndex(i);
         if (!vid) {
-          log(`  ✗ 第 ${i + 1} 个视频项不存在（可能被虚拟列表隐藏）`);
+          log(`  ✗ 第 ${i + 1} 个视频项不存在（枚举到 ${cur.length} 个，期望 ${count} 个）`);
           failed++;
           continue;
         }
+        await sleep(300);
 
         send("status", { text: `[${i + 1}/${count}] 放置第 ${i + 1} 个视频…` });
         await clickAt(vid.cx, vid.cy);

@@ -1,12 +1,24 @@
 {
   "manifest_version": 3,
-  "name": "Canva 批量字号",
-  "version": "1.0.3",
+  "name": "Canva字体工具",
+  "version": "1.0.4",
   "description": "一键把 Canva 设计中所有页面的字幕字号统一设置（通过可信调试事件操作，跳过小号水印文字）。",
   "permissions": ["debugger", "tabs", "storage", "sidePanel"],
   "host_permissions": ["https://*.canva.com/*", "https://openrouter.ai/*", "https://generativelanguage.googleapis.com/*", "http://localhost/*", "https://raw.githubusercontent.com/*"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "action": {
-    "default_title": "Canva 批量字号"
+    "default_title": "Canva字体工具",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "side_panel": {
     "default_path": "popup.html"
