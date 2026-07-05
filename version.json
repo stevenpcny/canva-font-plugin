@@ -1,5 +1,5 @@
 {
-  "version": "1.0.4",
+  "version": "1.0.41",
   "minVersion": "1.0.0",
   "downloadUrl": "https://github.com/stevenpcny/canva-font-plugin/releases/latest",
   "notes": "修复批量放置视频时超一屏文件夹遗漏的 bug（Uploads 面板懒加载滚动适配）；更名为「Canva字体工具」并新增图标。"
