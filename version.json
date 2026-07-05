@@ -1,6 +1,6 @@
 {
-  "version": "1.0.41",
+  "version": "1.0.42",
   "minVersion": "1.0.0",
   "downloadUrl": "https://github.com/stevenpcny/canva-font-plugin/releases/latest",
-  "notes": "修复批量放置视频时超一屏文件夹遗漏的 bug（Uploads 面板懒加载滚动适配）；更名为「Canva字体工具」并新增图标。"
+  "notes": "标题/正文分开设置字号：改用换算真实字号判断分档，避免悬浮工具条遮挡导致误判；点击改值前核对真实值，不符自动重试再跳过；遇到混合字号的文字框会提示手动处理，不再静默误判。"
 }

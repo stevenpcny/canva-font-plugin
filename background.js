@@ -445,40 +445,101 @@ function makeRunner(tabId, port, state) {
     }
   }
 
-  // 对当前渲染在画布上的这一页执行「枚举文字→逐个改字号」，返回本页统计
-  // split（可选）：{ boundary, titleSize, bodySize }——按字号框真实值分档：
-  // >= boundary 视为标题改 titleSize，否则视为正文改 bodySize。
-  // 判断依据必须是字号框的值而非渲染 px（画布缩放会让两者不一致）。
-  async function adjustCurrentPageTexts(pageLabel, size, threshold, split) {
-    let changed = 0, skipped = 0, errors = 0;
-    const texts = await enumerateTexts();
-    log(`${pageLabel}：发现 ${texts.length} 个文字元素。`);
-
+  // 校准「渲染 px → 真实字号」的比例：在本页未选中任何元素时逐个尝试点击
+  // enumerateTexts() 的候选（同一页面缩放下该比例对所有元素恒定，实测多次
+  // 均为常数），读到第一个非混合字号的真实值即可换算 scale，随后无需逐个
+  // 点击就能判断每个元素的真实字号，从根本上避免"点击→读值"被悬浮工具条
+  // 遮挡或读到上一个元素残留值而误判的问题。
+  async function calibrateScale(texts) {
     for (const t of texts) {
       await clickAt(t.cx, t.cy);
       await sleep(300);
       const f = await readFontField();
-      if (!f || !f.present || isNaN(f.value)) {
-        log(`  · 跳过「${t.text}」（非可编辑文字）`);
-        skipped++;
-        continue;
+      await pressEscape();
+      await sleep(150);
+      if (f && f.present && !isNaN(f.value) && f.value > 0) {
+        return t.fontPx / f.value;
       }
-      if (f.value < threshold) {
-        log(`  · 跳过「${t.text}」（当前 ${f.value} < 阈值 ${threshold}）`);
+    }
+    return null;
+  }
+
+  // 点击目标并用「校准换算出的真实字号」核对是否选中了预期元素：一致才继续。
+  // 悬浮工具条只会挡在目标框上方，若核对失败，向下偏移坐标重试一次，仍失败则
+  // 明确跳过（不再像旧逻辑那样盲信点击后读到的值）。
+  async function clickAndVerify(t, expectedReal, retried) {
+    await clickAt(t.cx, t.cy);
+    await sleep(300);
+    const f = await readFontField();
+    if (f && f.present && !isNaN(f.value) && Math.abs(f.value - expectedReal) <= 1) {
+      return { ok: true, f };
+    }
+    // 字号框存在但读不到数值 = 该选区内部混有多种字号（Canva 显示"混合值"占位），
+    // 不是点偏了，重试也没用，直接判定为需要人工处理。
+    if (f && f.present && isNaN(f.value)) {
+      return { ok: false, mixed: true, reason: "该文字框内混有多种字号（选中后字号框显示为空）" };
+    }
+    if (!retried) {
+      await pressEscape();
+      await sleep(150);
+      return clickAndVerify({ ...t, cy: t.cy + 10 }, expectedReal, true);
+    }
+    return {
+      ok: false,
+      reason: f && f.present
+        ? `读到 ${f.value}，与预期 ${expectedReal} 不符（可能选中了其他元素）`
+        : "字号框未出现（可能未选中文字）",
+    };
+  }
+
+  // 对当前渲染在画布上的这一页执行「枚举文字→逐个改字号」，返回本页统计
+  // split（可选）：{ boundary, titleSize, bodySize }——按真实字号分档：
+  // >= boundary 视为标题改 titleSize，否则视为正文改 bodySize。
+  // 真实字号来自 calibrateScale 换算，而非逐个点击读值（画布缩放会让渲染
+  // px 与真实值不一致，且逐个点击易被悬浮工具条遮挡导致误判）。
+  async function adjustCurrentPageTexts(pageLabel, size, threshold, split) {
+    let changed = 0, skipped = 0, errors = 0;
+    const texts = await enumerateTexts();
+    log(`${pageLabel}：发现 ${texts.length} 个文字元素。`);
+    if (texts.length === 0) return { changed, skipped, errors };
+
+    const scale = await calibrateScale(texts);
+    if (!scale) {
+      log(`  ⚠ 校准失败（未能读到任何元素的真实字号），本页跳过。`);
+      return { changed, skipped: texts.length, errors };
+    }
+
+    for (const t of texts) {
+      const real = Math.round(t.fontPx / scale);
+      if (real < threshold) {
+        log(`  · 跳过「${t.text}」（换算字号 ${real} < 阈值 ${threshold}）`);
         skipped++;
         continue;
       }
       const target = split
-        ? (f.value >= split.boundary ? split.titleSize : split.bodySize)
+        ? (real >= split.boundary ? split.titleSize : split.bodySize)
         : size;
-      if (Math.round(f.value) === target) {
+      if (real === target) {
         log(`  · 跳过「${t.text}」（已是目标字号 ${target}）`);
         skipped++;
         continue;
       }
+
+      const sel = await clickAndVerify(t, real);
+      if (!sel.ok) {
+        if (sel.mixed) {
+          log(`  ⚠ 「${t.text}」混有多种字号，工具无法自动分档，请手动到 Canva 里检查并调整`);
+          skipped++;
+        } else {
+          log(`  ✗ 「${t.text}」点击验证失败（${sel.reason}），已跳过`);
+          errors++;
+        }
+        continue;
+      }
+
       const res = await setSizeForSelected(target);
       if (res.applied) {
-        log(`  ✓ 「${t.text}」 ${f.value} → ${target}${split ? (f.value >= split.boundary ? "（标题）" : "（正文）") : ""}`);
+        log(`  ✓ 「${t.text}」 ${real} → ${target}${split ? (real >= split.boundary ? "（标题）" : "（正文）") : ""}`);
         changed++;
       } else {
         log(`  ✗ 「${t.text}」设置失败（结果 ${res.after}）`);
