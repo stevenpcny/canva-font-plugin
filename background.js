@@ -24,6 +24,16 @@ function makeRunner(tabId, port, state) {
   };
   const log = (text) => send("log", { text });
 
+  // 暂停等待用户手动修复：记录日志、通知 popup、阻塞直到用户点"继续"或整体取消
+  function waitForUserFix(text) {
+    if (state.cancelled) return Promise.resolve();
+    log(`⏸ 需要手动处理：${text}`);
+    send("need-fix", { text });
+    return new Promise((resolve) => {
+      state._resume = () => { state._resume = null; resolve(); };
+    });
+  }
+
   const cmd = (method, params = {}) =>
     chrome.debugger.sendCommand(target, method, params);
 
@@ -372,6 +382,7 @@ function makeRunner(tabId, port, state) {
     log(`${pageLabel}：发现 ${texts.length} 个文字元素。`);
 
     for (const t of texts) {
+      if (state.cancelled) break;
       await clickAt(t.cx, t.cy);
       await sleep(300);
       const res = await setAnimationColorForSelected(hexNoHash);
@@ -382,9 +393,73 @@ function makeRunner(tabId, port, state) {
         log(`  · 跳过「${t.text}」（非字幕）`);
         skipped++;
       } else {
-        log(`  ✗ 「${t.text}」失败（${res.reason}）`);
+        await waitForUserFix(`「${t.text}」失败（${res.reason}）`);
+        if (state.cancelled) break;
         errors++;
+        continue;
       }
+    }
+    return { changed, skipped, errors };
+  }
+
+  // 转录面板逐段套 Highlight：同一页可能有多段字幕，画布上只有播放头当前
+  // 时刻那段会渲染（其余塌缩成 <1px，enumerateTexts 的 width>10 过滤会挡掉），
+  // 必须像字号功能的 adjustPageCaptionSegs 一样逐段走转录面板点击，
+  // 不能靠画布枚举一次性处理整页（见 arch_decisions #21 同根因）。
+  async function adjustPageCaptionAnimSegs(page, lines, hexNoHash) {
+    let changed = 0, skipped = 0, errors = 0;
+    log(`第 ${page} 页：转录面板字幕 ${lines.length} 段。`);
+
+    for (const text of lines) {
+      if (state.cancelled) break;
+      const label = text.slice(0, 20);
+
+      if (!(await openCaptionsPanel())) {
+        await waitForUserFix(`无法打开字幕面板：「${label}」`);
+        if (state.cancelled) break;
+        errors++;
+        continue;
+      }
+      await sleep(250);
+      const line = await findTranscriptLine(page, text);
+      if (!line) {
+        await waitForUserFix(`转录面板未找到「${label}」`);
+        if (state.cancelled) break;
+        errors++;
+        continue;
+      }
+      await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 选中该段
+      await sleep(600);
+      let f = await readFontField();
+      if (!f || !f.present || isNaN(f.value)) {
+        // 转录点击未带出选中态 → 在画布上点渲染出来的该段
+        const cap = await findRenderedCaption(text);
+        if (cap && cap.ok) {
+          await clickAt(cap.cx, cap.cy);
+          await sleep(300);
+          f = await readFontField();
+        }
+      }
+      if (!f || !f.present || isNaN(f.value)) {
+        await waitForUserFix(`「${label}」未能选中`);
+        if (state.cancelled) break;
+        errors++;
+      } else {
+        const res = await setAnimationColorForSelected(hexNoHash);
+        if (res.applied) {
+          log(`  ✓ 「${label}」高亮色 → #${hexNoHash}`);
+          changed++;
+        } else if (res.reason === "not-caption") {
+          log(`  · 跳过「${label}」（非字幕）`);
+          skipped++;
+        } else {
+          await waitForUserFix(`「${label}」失败（${res.reason}）`);
+          if (state.cancelled) break;
+          errors++;
+        }
+      }
+      await pressEscape();
+      await sleep(150);
     }
     return { changed, skipped, errors };
   }
@@ -399,21 +474,43 @@ function makeRunner(tabId, port, state) {
 
       const info = await readPageInfo();
 
+      // 有原生字幕的设计：先读一次转录面板，拿到每页的全部字幕段，
+      // 逐段处理才能覆盖同页的多段字幕（见上方 adjustPageCaptionAnimSegs 注释）。
+      let captionsByPage = null;
+      if (await openCaptionsPanel()) {
+        const transcript = await readCaptionsTranscript();
+        if (transcript.length) {
+          captionsByPage = new Map();
+          for (const t of transcript) {
+            if (!captionsByPage.has(t.page)) captionsByPage.set(t.page, []);
+            captionsByPage.get(t.page).push(t.text);
+          }
+        }
+      }
+
+      log(`高亮动画颜色 #${hexNoHash}。`);
+
       if (allPages && !info) {
-        log(`高亮动画颜色 #${hexNoHash}。`);
-        const ok = await iterateVideoPagesViaCaptions(async (label) => {
-          const r = await adjustCurrentPageAnimation(label, hexNoHash);
-          changed += r.changed; skipped += r.skipped; errors += r.errors;
-        });
-        if (!ok) {
+        if (!captionsByPage) {
+          log("未能打开 Captions 转录面板，无法枚举全部页（当前设计可能没有 Canva 原生字幕）。");
           send("done", { ok: false });
           return;
+        }
+        const pages = [...captionsByPage.keys()].sort((a, b) => a - b);
+        log(`所有页（共 ${pages.length} 页，经字幕面板确认）。`);
+        for (const p of pages) {
+          if (state.cancelled) break;
+          send("status", { text: `第 ${p} / ${pages[pages.length - 1]} 页…` });
+          const s = await adjustPageCaptionAnimSegs(p, captionsByPage.get(p), hexNoHash);
+          changed += s.changed; skipped += s.skipped; errors += s.errors;
+          await pressEscape();
+          await sleep(150);
         }
       } else {
         const total = info ? info.total : 1;
         const startPage = allPages ? 1 : (info ? info.current : 1);
         const endPage = allPages ? total : startPage;
-        log(`${allPages ? "所有" : "仅当前"}页（${startPage}–${endPage} / ${total}），高亮动画颜色 #${hexNoHash}。`);
+        log(`${allPages ? "所有" : "仅当前"}页（${startPage}–${endPage} / ${total}）。`);
 
         for (let i = startPage; i <= endPage; i++) {
           if (state.cancelled) break;
@@ -421,15 +518,30 @@ function makeRunner(tabId, port, state) {
 
           if (allPages) {
             if (!(await navigateToPage(i))) {
-              log(`  ✗ 第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图），跳过`);
+              await waitForUserFix(`第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图）`);
+              if (state.cancelled) break;
               errors++;
               continue;
             }
           }
           await sleep(400);
 
-          const r = await adjustCurrentPageAnimation(`第 ${i} 页`, hexNoHash);
-          changed += r.changed; skipped += r.skipped; errors += r.errors;
+          // 本页有字幕段则走转录面板逐段处理；否则（经典无字幕设计/该页无匹配字幕）
+          // 退回画布枚举（只能处理播放头当前渲染的那一段，但这类设计本来就只有一段）
+          let handledViaTranscript = false;
+          if (captionsByPage) {
+            let capPage = info && captionsByPage.has(i) ? i : null;
+            if (capPage == null) capPage = await findCurrentCaptionPage(captionsByPage);
+            if (capPage != null && captionsByPage.has(capPage)) {
+              const s = await adjustPageCaptionAnimSegs(capPage, captionsByPage.get(capPage), hexNoHash);
+              changed += s.changed; skipped += s.skipped; errors += s.errors;
+              handledViaTranscript = true;
+            }
+          }
+          if (!handledViaTranscript) {
+            const r = await adjustCurrentPageAnimation(`第 ${i} 页`, hexNoHash);
+            changed += r.changed; skipped += r.skipped; errors += r.errors;
+          }
           await pressEscape();
           await sleep(150);
         }
@@ -510,6 +622,7 @@ function makeRunner(tabId, port, state) {
     }
 
     for (const t of texts) {
+      if (state.cancelled) break;
       const real = Math.round(t.fontPx / scale);
       if (real < threshold) {
         log(`  · 跳过「${t.text}」（换算字号 ${real} < 阈值 ${threshold}）`);
@@ -528,10 +641,12 @@ function makeRunner(tabId, port, state) {
       const sel = await clickAndVerify(t, real);
       if (!sel.ok) {
         if (sel.mixed) {
-          log(`  ⚠ 「${t.text}」混有多种字号，工具无法自动分档，请手动到 Canva 里检查并调整`);
+          await waitForUserFix(`「${t.text}」混有多种字号，工具无法自动分档，请手动到 Canva 里检查并调整`);
+          if (state.cancelled) break;
           skipped++;
         } else {
-          log(`  ✗ 「${t.text}」点击验证失败（${sel.reason}），已跳过`);
+          await waitForUserFix(`「${t.text}」点击验证失败（${sel.reason}）`);
+          if (state.cancelled) break;
           errors++;
         }
         continue;
@@ -542,7 +657,8 @@ function makeRunner(tabId, port, state) {
         log(`  ✓ 「${t.text}」 ${real} → ${target}${split ? (real >= split.boundary ? "（标题）" : "（正文）") : ""}`);
         changed++;
       } else {
-        log(`  ✗ 「${t.text}」设置失败（结果 ${res.after}）`);
+        await waitForUserFix(`「${t.text}」设置失败（结果 ${res.after}）`);
+        if (state.cancelled) break;
         errors++;
       }
     }
@@ -608,14 +724,16 @@ function makeRunner(tabId, port, state) {
       }
 
       if (!(await openCaptionsPanel())) {
-        log(`  ✗ 无法打开字幕面板，跳过「${label}」`);
+        await waitForUserFix(`无法打开字幕面板：「${label}」`);
+        if (state.cancelled) break;
         errors++;
         continue;
       }
       await sleep(250);
       const line = await findTranscriptLine(page, text);
       if (!line) {
-        log(`  ✗ 转录面板未找到「${label}」，跳过`);
+        await waitForUserFix(`转录面板未找到「${label}」`);
+        if (state.cancelled) break;
         errors++;
         continue;
       }
@@ -632,7 +750,8 @@ function makeRunner(tabId, port, state) {
         }
       }
       if (!f || !f.present || isNaN(f.value)) {
-        log(`  ✗ 「${label}」未能选中，跳过`);
+        await waitForUserFix(`「${label}」未能选中`);
+        if (state.cancelled) break;
         errors++;
       } else if (f.value < threshold) {
         log(`  · 跳过「${label}」（当前 ${f.value} < 阈值 ${threshold}）`);
@@ -657,7 +776,8 @@ function makeRunner(tabId, port, state) {
             changed++;
             strip = await readTimelineStripSizes(); // 改动后重读，供后续段的同组联动判断
           } else {
-            log(`  ✗ 「${label}」设置失败（结果 ${res.after}）`);
+            await waitForUserFix(`「${label}」设置失败（结果 ${res.after}）`);
+            if (state.cancelled) break;
             errors++;
           }
         }
@@ -741,7 +861,8 @@ function makeRunner(tabId, port, state) {
 
           if (allPages) {
             if (!(await navigateToPage(i))) {
-              log(`  ✗ 第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图），跳过`);
+              await waitForUserFix(`第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图）`);
+              if (state.cancelled) break;
               errors++;
               continue;
             }
@@ -816,6 +937,14 @@ function makeRunner(tabId, port, state) {
     for (const frac of [0.4, 0.5, 0.6, 0.3, 0.7, 0.2, 0.8]) {
       const cx = Math.round(frame.left + frame.width / 2);
       const cy = Math.round(frame.top + frame.height * frac);
+      // 视频页设计会在画布中央叠加播放器控件（role="group" aria-label="Video controls"），
+      // 盲点高度分数探测字幕时如果落在这个控件上会点到播放/暂停按钮而不是字幕。
+      // 点击前先探测该坐标是否落在播放器控件内，命中则跳过这个分数不点。
+      const onVideoControls = await evaluate(`(() => {
+        const el = document.elementFromPoint(${cx}, ${cy});
+        return !!(el && el.closest('[aria-label="Video controls"]'));
+      })()`);
+      if (onVideoControls) continue;
       await clickAt(cx, cy);
       await sleep(350);
       const cap = await findToolbarButton("Captions");
@@ -1050,12 +1179,14 @@ ${lines}`;
       send("status", { text: `第 ${p} / ${pages[pages.length - 1]} 页…` });
 
       if (!(await openCaptionsPanel())) {
-        log(`  ✗ 第 ${p} 页：无法打开字幕面板，跳过`);
+        await waitForUserFix(`第 ${p} 页：无法打开字幕面板`);
+        if (state.cancelled) break;
         continue;
       }
       const line = await findTranscriptLine(p, firstTextByPage.get(p));
       if (!line) {
-        log(`  ✗ 第 ${p} 页：转录面板里未找到该页字幕，跳过`);
+        await waitForUserFix(`第 ${p} 页：转录面板里未找到该页字幕`);
+        if (state.cancelled) break;
         continue;
       }
       await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 渲染该页
@@ -1162,14 +1293,16 @@ ${lines}`;
 
         // 1) 打开字幕面板并点中该条 —— 点击会让 Canva 自动定位播放头+选中该字幕
         if (!(await openCaptionsPanel())) {
-          log(`  ✗ 无法打开字幕面板，跳过「${c.original.slice(0, 24)}」`);
+          await waitForUserFix(`无法打开字幕面板：「${c.original.slice(0, 24)}」`);
+          if (state.cancelled) break;
           failed++;
           continue;
         }
         await sleep(250);
         const line = await findTranscriptLine(c.page, c.original);
         if (!line) {
-          log(`  ✗ 第${c.page}页转录里未找到「${c.original.slice(0, 24)}」，跳过`);
+          await waitForUserFix(`第${c.page}页转录里未找到「${c.original.slice(0, 24)}」`);
+          if (state.cancelled) break;
           failed++;
           continue;
         }
@@ -1179,7 +1312,8 @@ ${lines}`;
         // 2) 在画布上定位渲染出来的该字幕（模糊匹配，兼容换行拼接的空格差异）
         const cap = await findRenderedCaption(c.original);
         if (!cap || !cap.ok) {
-          log(`  ✗ 画布上未匹配到「${c.original.slice(0, 24)}」(渲染:${cap && cap.seen ? cap.seen.join(" | ") : "无"})，跳过`);
+          await waitForUserFix(`画布上未匹配到「${c.original.slice(0, 24)}」(渲染:${cap && cap.seen ? cap.seen.join(" | ") : "无"})`);
+          if (state.cancelled) break;
           failed++;
           await pressEscape();
           await sleep(150);
@@ -1471,7 +1605,8 @@ ${lines}`;
           newPageNum = await addOnePageAndNavigate();
           log(`\n[${i + 1}/${count}] 新建第 ${newPageNum} 页`);
         } catch (e) {
-          log(`  ✗ 创建页面失败: ${e.message}`);
+          await waitForUserFix(`创建页面失败: ${e.message}`);
+          if (state.cancelled) break;
           failed++;
           continue;
         }
@@ -1479,14 +1614,16 @@ ${lines}`;
         // 2. 确保仍在该文件夹视图（创建页可能改变面板），按索引取第 i 个
         const cur = await enterFolderVideos(folderName, count);
         if (cur && cur.error) {
-          log(`  ✗ 无法回到文件夹「${folderName}」，中止剩余放置`);
+          await waitForUserFix(`无法回到文件夹「${folderName}」，中止剩余放置`);
+          if (state.cancelled) break;
           failed++;
           break;
         }
         // 瓦片可能在视口外，取坐标前先 scrollIntoView
         const vid = await getVideoTileRectByIndex(i);
         if (!vid) {
-          log(`  ✗ 第 ${i + 1} 个视频项不存在（枚举到 ${cur.length} 个，期望 ${count} 个）`);
+          await waitForUserFix(`第 ${i + 1} 个视频项不存在（枚举到 ${cur.length} 个，期望 ${count} 个）`);
+          if (state.cancelled) break;
           failed++;
           continue;
         }
@@ -1586,27 +1723,53 @@ ${lines}`;
     const inputs = await getPositionInputCoords();
     if (!inputs) return { applied: false, reason: "no-position-inputs" };
 
-    // 设置 X
+    // 设置 X：填入后先回读校验，符合预期才回车；回车后再回读确认已生效
     await clickAt(inputs.X.cx, inputs.X.cy);
     await sleep(100);
     await pressSelectAll();
     await sleep(60);
     await typeText(String(x));
     await sleep(60);
+    let checkX = await readPositionValues();
+    if (!checkX || Math.round(Number(checkX.x)) !== Math.round(Number(x))) {
+      return { applied: false, reason: "x-value-mismatch-before-enter", expected: x, actual: checkX && checkX.x };
+    }
     await pressEnter();
     await sleep(200);
+    checkX = await readPositionValues();
+    if (!checkX || Math.round(Number(checkX.x)) !== Math.round(Number(x))) {
+      return { applied: false, reason: "x-value-mismatch-after-enter", expected: x, actual: checkX && checkX.x };
+    }
 
-    // 设置 Y
+    // 设置 Y：同样两段校验
     await clickAt(inputs.Y.cx, inputs.Y.cy);
     await sleep(100);
     await pressSelectAll();
     await sleep(60);
     await typeText(String(y));
     await sleep(60);
+    let checkY = await readPositionValues();
+    if (!checkY || Math.round(Number(checkY.y)) !== Math.round(Number(y))) {
+      return { applied: false, reason: "y-value-mismatch-before-enter", expected: y, actual: checkY && checkY.y };
+    }
     await pressEnter();
     await sleep(300);
+    checkY = await readPositionValues();
+    if (!checkY || Math.round(Number(checkY.y)) !== Math.round(Number(y))) {
+      return { applied: false, reason: "y-value-mismatch-after-enter", expected: y, actual: checkY && checkY.y };
+    }
 
     return { applied: true };
+  }
+
+  function formatPositionFailure(label, x, y, res) {
+    if (res.reason && res.reason.startsWith("x-")) {
+      return `${label}位置未生效：期望X=${res.expected ?? x}，实际读到${res.actual}（原因：${res.reason}）`;
+    }
+    if (res.reason && res.reason.startsWith("y-")) {
+      return `${label}位置未生效：期望Y=${res.expected ?? y}，实际读到${res.actual}（原因：${res.reason}）`;
+    }
+    return `${label}设置失败（${res.reason}）`;
   }
 
   async function runReadPosition() {
@@ -1649,6 +1812,77 @@ ${lines}`;
     }
   }
 
+  // 转录面板逐段设置位置：同一页可能有多段字幕，画布上只有播放头当前
+  // 时刻那段会渲染（其余塌缩成 <1px，enumerateTexts 的 width>10 过滤会挡掉），
+  // 必须逐段走转录面板点击，不能靠画布枚举一次性处理整页（见 arch_decisions #21 同根因）。
+  async function adjustPageCaptionPositionSegs(page, lines, x, y) {
+    let applied = 0, errors = 0;
+    log(`第 ${page} 页：转录面板字幕 ${lines.length} 段。`);
+
+    for (const text of lines) {
+      if (state.cancelled) break;
+      const label = text.slice(0, 20);
+
+      if (!(await openCaptionsPanel())) {
+        await waitForUserFix(`无法打开字幕面板：「${label}」`);
+        if (state.cancelled) break;
+        errors++;
+        continue;
+      }
+      await sleep(250);
+      const line = await findTranscriptLine(page, text);
+      if (!line) {
+        await waitForUserFix(`转录面板未找到「${label}」`);
+        if (state.cancelled) break;
+        errors++;
+        continue;
+      }
+      await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 选中该段
+      await sleep(600);
+      let f = await readFontField();
+      if (!f || !f.present || isNaN(f.value)) {
+        // 转录点击未带出选中态 → 在画布上点渲染出来的该段
+        const cap = await findRenderedCaption(text);
+        if (cap && cap.ok) {
+          await clickAt(cap.cx, cap.cy);
+          await sleep(300);
+          f = await readFontField();
+        }
+      }
+      if (!f || !f.present || isNaN(f.value)) {
+        await waitForUserFix(`「${label}」未能选中`);
+        if (state.cancelled) break;
+        errors++;
+      } else {
+        const panelOpen = await isPositionPanelOpen();
+        if (!panelOpen) {
+          try {
+            await openPositionPanel();
+          } catch (e) {
+            await waitForUserFix(`「${label}」无法打开位置面板（${e.message}）`);
+            if (state.cancelled) break;
+            errors++;
+            await pressEscape();
+            await sleep(150);
+            continue;
+          }
+        }
+        const res = await setPositionForSelected(x, y);
+        if (res.applied) {
+          log(`  ✓ 「${label}」→ (${x}, ${y})`);
+          applied++;
+        } else {
+          await waitForUserFix(formatPositionFailure(`第${page}页「${label}」`, x, y, res));
+          if (state.cancelled) break;
+          errors++;
+        }
+      }
+      await pressEscape();
+      await sleep(150);
+    }
+    return { applied, errors };
+  }
+
   // 对当前渲染在画布上的这一页执行「枚举文字→逐个设置位置」，返回本页统计
   async function adjustCurrentPagePosition(pageLabel, x, y) {
     let applied = 0, errors = 0;
@@ -1656,6 +1890,7 @@ ${lines}`;
     log(`${pageLabel}：发现 ${texts.length} 个文字元素。`);
 
     for (const t of texts) {
+      if (state.cancelled) break;
       await clickAt(t.cx, t.cy);
       await sleep(300);
 
@@ -1665,7 +1900,8 @@ ${lines}`;
         try {
           await openPositionPanel();
         } catch (e) {
-          log(`  ✗ 「${t.text}」无法打开位置面板（${e.message}）`);
+          await waitForUserFix(`「${t.text}」无法打开位置面板（${e.message}）`);
+          if (state.cancelled) break;
           errors++;
           continue;
         }
@@ -1676,7 +1912,8 @@ ${lines}`;
         log(`  ✓ 「${t.text}」→ (${x}, ${y})`);
         applied++;
       } else {
-        log(`  ✗ 「${t.text}」设置失败（${res.reason}）`);
+        await waitForUserFix(formatPositionFailure(`${pageLabel}「${t.text}」`, x, y, res));
+        if (state.cancelled) break;
         errors++;
       }
     }
@@ -1692,21 +1929,43 @@ ${lines}`;
 
       const info = await readPageInfo();
 
+      // 有原生字幕的设计：先读一次转录面板，拿到每页的全部字幕段，
+      // 逐段处理才能覆盖同页的多段字幕（见 adjustPageCaptionPositionSegs 注释）。
+      let captionsByPage = null;
+      if (await openCaptionsPanel()) {
+        const transcript = await readCaptionsTranscript();
+        if (transcript.length) {
+          captionsByPage = new Map();
+          for (const t of transcript) {
+            if (!captionsByPage.has(t.page)) captionsByPage.set(t.page, []);
+            captionsByPage.get(t.page).push(t.text);
+          }
+        }
+      }
+
+      log(`目标位置 X=${x}, Y=${y}`);
+
       if (allPages && !info) {
-        log(`目标位置 X=${x}, Y=${y}`);
-        const ok = await iterateVideoPagesViaCaptions(async (label) => {
-          const r = await adjustCurrentPagePosition(label, x, y);
-          applied += r.applied; errors += r.errors;
-        });
-        if (!ok) {
+        if (!captionsByPage) {
+          log("未能打开 Captions 转录面板，无法枚举全部页（当前设计可能没有 Canva 原生字幕）。");
           send("done", { ok: false });
           return;
+        }
+        const pages = [...captionsByPage.keys()].sort((a, b) => a - b);
+        log(`所有页（共 ${pages.length} 页，经字幕面板确认）。`);
+        for (const p of pages) {
+          if (state.cancelled) break;
+          send("status", { text: `第 ${p} / ${pages[pages.length - 1]} 页…` });
+          const s = await adjustPageCaptionPositionSegs(p, captionsByPage.get(p), x, y);
+          applied += s.applied; errors += s.errors;
+          await pressEscape();
+          await sleep(150);
         }
       } else {
         const total = info ? info.total : 1;
         const startPage = allPages ? 1 : (info ? info.current : 1);
         const endPage = allPages ? total : startPage;
-        log(`${allPages ? "所有" : "仅当前"}页（${startPage}–${endPage} / ${total}），目标位置 X=${x}, Y=${y}`);
+        log(`${allPages ? "所有" : "仅当前"}页（${startPage}–${endPage} / ${total}）。`);
 
         for (let i = startPage; i <= endPage; i++) {
           if (state.cancelled) break;
@@ -1714,15 +1973,30 @@ ${lines}`;
 
           if (allPages) {
             if (!(await navigateToPage(i))) {
-              log(`  ✗ 第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图），跳过`);
+              await waitForUserFix(`第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图）`);
+              if (state.cancelled) break;
               errors++;
               continue;
             }
           }
           await sleep(400);
 
-          const r = await adjustCurrentPagePosition(`第 ${i} 页`, x, y);
-          applied += r.applied; errors += r.errors;
+          // 本页有字幕段则走转录面板逐段处理；否则（经典无字幕设计/该页无匹配字幕）
+          // 退回画布枚举（只能处理播放头当前渲染的那一段，但这类设计本来就只有一段）
+          let handledViaTranscript = false;
+          if (captionsByPage) {
+            let capPage = info && captionsByPage.has(i) ? i : null;
+            if (capPage == null) capPage = await findCurrentCaptionPage(captionsByPage);
+            if (capPage != null && captionsByPage.has(capPage)) {
+              const s = await adjustPageCaptionPositionSegs(capPage, captionsByPage.get(capPage), x, y);
+              applied += s.applied; errors += s.errors;
+              handledViaTranscript = true;
+            }
+          }
+          if (!handledViaTranscript) {
+            const r = await adjustCurrentPagePosition(`第 ${i} 页`, x, y);
+            applied += r.applied; errors += r.errors;
+          }
           await pressEscape();
           await sleep(150);
         }
@@ -1750,8 +2024,18 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "run") return;
   // 弹窗关闭 → port 断开 → 置取消标志，运行循环检测后提前退出
   const state = { cancelled: false };
-  port.onDisconnect.addListener(() => { state.cancelled = true; });
+  port.onDisconnect.addListener(() => {
+    state.cancelled = true;
+    state._resume?.();
+  });
   port.onMessage.addListener(async (msg) => {
+    // 停止按钮：置取消标志，运行中的循环在下一次检测点提前退出并正常收尾
+    if (msg.type === "cancel") {
+      state.cancelled = true;
+      state._resume?.();
+      return;
+    }
+    if (msg.type === "resume") { state._resume?.(); return; }
     const runner = makeRunner(msg.tabId, port, state);
     const allPages = msg.allPages !== false;
     if (msg.type === "run") await runner.run(msg.size, msg.threshold, allPages, msg.split || null);

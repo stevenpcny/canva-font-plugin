@@ -2,6 +2,8 @@ const runBtn = document.getElementById("run");
 const runAddPagesBtn = document.getElementById("runAddPages");
 const runUploadVideosBtn = document.getElementById("runUploadVideos");
 const runAnimateBtn = document.getElementById("runAnimate");
+const runComboBtn = document.getElementById("runCombo");
+const stopBtn = document.getElementById("stopBtn");
 const proofreadBtn = document.getElementById("runProofread");
 const applyBtn = document.getElementById("applyCorrections");
 const statusEl = document.getElementById("status");
@@ -56,7 +58,7 @@ function lockPlugin(reason, downloadUrl) {
       chrome.tabs.create({ url: downloadUrl || DEFAULT_DOWNLOAD_URL });
     overlay.style.display = "block";
   }
-  ["run", "runAddPages", "runUploadVideos", "runAnimate", "runProofread", "applyCorrections"]
+  ["run", "runAddPages", "runUploadVideos", "runAnimate", "runCombo", "runProofread", "applyCorrections"]
     .forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = true; });
 }
 
@@ -141,6 +143,8 @@ const readPosBtn = document.getElementById("readPos");
 const applyPosBtn = document.getElementById("applyPos");
 
 let pendingCorrections = null; // 校对结果暂存，等用户确认
+let activePort = null;   // 当前正在运行的任务端口，供停止按钮发送 cancel
+let comboCancelled = false; // 一键应用序列中途被停止，跳过后续步骤
 
 function log(line) {
   logEl.style.display = "block";
@@ -330,30 +334,80 @@ function setBusy(busy) {
   runAddPagesBtn.disabled = busy;
   runUploadVideosBtn.disabled = busy;
   runAnimateBtn.disabled = busy;
+  runComboBtn.disabled = busy;
   readPosBtn.disabled = busy;
   applyPosBtn.disabled = busy;
   proofreadBtn.disabled = busy;
+  stopBtn.disabled = !busy;
   if (busy) applyBtn.disabled = true;
 }
+
+// 停止按钮：随时可点，向当前运行任务所在的端口发 cancel，
+// 后台运行循环在下一次检测点提前退出并正常收尾（不是强杀，日志/统计仍会输出）。
+stopBtn.addEventListener("click", () => {
+  comboCancelled = true;
+  if (activePort) {
+    try { activePort.postMessage({ type: "cancel" }); } catch (_) {}
+  }
+  document.getElementById("needFixBanner").style.display = "none";
+  statusEl.textContent = "⏹ 已发送停止请求，等待当前步骤收尾…";
+});
 
 function startTask(payload) {
   setBusy(true);
   statusEl.textContent = "正在运行…";
   logEl.textContent = "";
+  document.getElementById("needFixBanner").style.display = "none";
 
   const port = chrome.runtime.connect({ name: "run" });
+  activePort = port;
   port.postMessage(payload);
 
   port.onMessage.addListener((msg) => {
     if (msg.type === "log") log(msg.text);
     else if (msg.type === "status") statusEl.textContent = msg.text;
+    else if (msg.type === "need-fix") {
+      const banner = document.getElementById("needFixBanner");
+      document.getElementById("needFixText").textContent = msg.text;
+      banner.style.display = "block";
+      document.getElementById("needFixContinue").onclick = () => {
+        banner.style.display = "none";
+        try { port.postMessage({ type: "resume" }); } catch (_) {}
+      };
+    }
     else if (msg.type === "done") {
       statusEl.textContent = msg.ok ? "✅ 完成。" : "⚠️ 已结束（有错误，见日志）。";
+      activePort = null;
       setBusy(false);
     }
   });
 
-  port.onDisconnect.addListener(() => setBusy(false));
+  port.onDisconnect.addListener(() => { activePort = null; setBusy(false); });
+}
+
+// 单个步骤的 Promise 化端口调用，供「一键应用」按序链式执行；resolve 传出 done.ok
+function runComboStep(payload) {
+  return new Promise((resolve) => {
+    document.getElementById("needFixBanner").style.display = "none";
+    const port = chrome.runtime.connect({ name: "run" });
+    activePort = port;
+    port.postMessage(payload);
+    port.onMessage.addListener((msg) => {
+      if (msg.type === "log") log(msg.text);
+      else if (msg.type === "status") statusEl.textContent = msg.text;
+      else if (msg.type === "need-fix") {
+        const banner = document.getElementById("needFixBanner");
+        document.getElementById("needFixText").textContent = msg.text;
+        banner.style.display = "block";
+        document.getElementById("needFixContinue").onclick = () => {
+          banner.style.display = "none";
+          try { port.postMessage({ type: "resume" }); } catch (_) {}
+        };
+      }
+      else if (msg.type === "done") resolve(!!msg.ok);
+    });
+    port.onDisconnect.addListener(() => resolve(false));
+  });
 }
 
 // —— 校对专用消息通道 ——
@@ -366,13 +420,24 @@ function startProofread(payload) {
   proofLogEl.innerHTML = "";
   proofLogEl.style.display = "none";
   logEl.textContent = "";
+  document.getElementById("needFixBanner").style.display = "none";
 
   const port = chrome.runtime.connect({ name: "run" });
+  activePort = port;
   port.postMessage(payload);
 
   port.onMessage.addListener((msg) => {
     if (msg.type === "log") log(msg.text);
     else if (msg.type === "status") statusEl.textContent = msg.text;
+    else if (msg.type === "need-fix") {
+      const banner = document.getElementById("needFixBanner");
+      document.getElementById("needFixText").textContent = msg.text;
+      banner.style.display = "block";
+      document.getElementById("needFixContinue").onclick = () => {
+        banner.style.display = "none";
+        try { port.postMessage({ type: "resume" }); } catch (_) {}
+      };
+    }
     else if (msg.type === "proofread-result") {
       const corrections = msg.corrections || [];
       if (corrections.length === 0) {
@@ -397,15 +462,17 @@ function startProofread(payload) {
       statusEl.textContent = corrections.length
         ? `校对完成，${corrections.length} 处建议。审核后点「应用修正」。`
         : "校对完成，无需修正。";
+      activePort = null;
       setBusy(false);
     }
     else if (msg.type === "done") {
       if (!msg.ok) statusEl.textContent = "⚠️ 校对出错，见日志。";
+      activePort = null;
       setBusy(false);
     }
   });
 
-  port.onDisconnect.addListener(() => setBusy(false));
+  port.onDisconnect.addListener(() => { activePort = null; setBusy(false); });
 }
 
 function esc(s) {
@@ -529,26 +596,39 @@ readPosBtn.addEventListener("click", async () => {
   setBusy(true);
   statusEl.textContent = "正在读取位置…";
   logEl.textContent = "";
+  document.getElementById("needFixBanner").style.display = "none";
 
   const port = chrome.runtime.connect({ name: "run" });
+  activePort = port;
   port.postMessage({ type: "read-position", tabId: tab.id });
 
   port.onMessage.addListener((msg) => {
     if (msg.type === "log") log(msg.text);
     else if (msg.type === "status") statusEl.textContent = msg.text;
+    else if (msg.type === "need-fix") {
+      const banner = document.getElementById("needFixBanner");
+      document.getElementById("needFixText").textContent = msg.text;
+      banner.style.display = "block";
+      document.getElementById("needFixContinue").onclick = () => {
+        banner.style.display = "none";
+        try { port.postMessage({ type: "resume" }); } catch (_) {}
+      };
+    }
     else if (msg.type === "position-result") {
       posXEl.value = msg.x;
       posYEl.value = msg.y;
       statusEl.textContent = `已读取位置：X=${msg.x}, Y=${msg.y}`;
+      activePort = null;
       setBusy(false);
     }
     else if (msg.type === "done") {
       if (!msg.ok) statusEl.textContent = "⚠️ 读取位置失败，见日志。";
+      activePort = null;
       setBusy(false);
     }
   });
 
-  port.onDisconnect.addListener(() => setBusy(false));
+  port.onDisconnect.addListener(() => { activePort = null; setBusy(false); });
 });
 
 applyPosBtn.addEventListener("click", async () => {
@@ -564,4 +644,72 @@ applyPosBtn.addEventListener("click", async () => {
 
   const allPages = !document.getElementById("currentOnly").checked;
   startTask({ type: "set-position", tabId: tab.id, x, y, allPages });
+});
+
+// 一键应用：按序复用字号/位置/高亮三块当前填写的值，一次性跑完；
+// 位置 X/Y 未填写则跳过该步；中途可点「停止当前操作」，跳过剩余步骤。
+runComboBtn.addEventListener("click", async () => {
+  const size = parseInt(document.getElementById("size").value, 10);
+  const threshold = parseInt(document.getElementById("threshold").value, 10);
+  const valid = (n) => n >= 1 && n <= 800;
+  let split = null;
+  if (splitModeEl.checked) {
+    split = {
+      boundary: parseInt(document.getElementById("splitBoundary").value, 10),
+      titleSize: parseInt(document.getElementById("titleSize").value, 10),
+      bodySize: parseInt(document.getElementById("bodySize").value, 10),
+    };
+    if (!valid(split.boundary) || !valid(split.titleSize) || !valid(split.bodySize)) {
+      statusEl.textContent = "请输入有效的分界值/标题/正文字号（1–800）。";
+      return;
+    }
+  } else if (!valid(size)) {
+    statusEl.textContent = "请输入有效的目标字号（1–800）。";
+    return;
+  }
+
+  const x = posXEl.value.trim();
+  const y = posYEl.value.trim();
+
+  const color = normalizeHex(colorHexEl.value);
+  if (!color) {
+    statusEl.textContent = "请输入有效的高亮颜色（如 #0CC0DF）。";
+    return;
+  }
+  colorHexEl.value = color;
+  colorEl.value = color;
+
+  const tab = await getCanvaTab();
+  if (!tab) return;
+
+  const allPages = !document.getElementById("currentOnly").checked;
+
+  setBusy(true);
+  comboCancelled = false;
+  logEl.textContent = "";
+  document.getElementById("needFixBanner").style.display = "none";
+
+  log("== 第 1/3 步：调整字号 ==");
+  statusEl.textContent = "第 1/3 步：调整字号…";
+  await runComboStep({ type: "run", tabId: tab.id, size, threshold, allPages, split });
+
+  if (!comboCancelled) {
+    if (x && y) {
+      log("\n== 第 2/3 步：统一位置 ==");
+      statusEl.textContent = "第 2/3 步：统一位置…";
+      await runComboStep({ type: "set-position", tabId: tab.id, x, y, allPages });
+    } else {
+      log("\n（未填写位置坐标，跳过统一位置这一步）");
+    }
+  }
+
+  if (!comboCancelled) {
+    log("\n== 第 3/3 步：套用高亮动画 ==");
+    statusEl.textContent = "第 3/3 步：套用高亮动画…";
+    await runComboStep({ type: "animate", tabId: tab.id, color, allPages });
+  }
+
+  activePort = null;
+  statusEl.textContent = comboCancelled ? "⛔ 已停止。" : "✅ 全部完成。";
+  setBusy(false);
 });
