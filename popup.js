@@ -137,6 +137,7 @@ const proofRulesEl = document.getElementById("proofRules");
 const resetRulesBtn = document.getElementById("resetRules");
 const DEFAULT_PROOF_RULES = proofRulesEl.defaultValue; // textarea 初始内容即默认规则
 const videoFolderNameEl = document.getElementById("videoFolderName");
+const watermarkKeywordsEl = document.getElementById("watermarkKeywords");
 const posXEl = document.getElementById("posX");
 const posYEl = document.getElementById("posY");
 const readPosBtn = document.getElementById("readPos");
@@ -256,7 +257,7 @@ function syncProviderUI() {
 // API key / model / provider + 校对规则 + 文件夹名 持久化
 chrome.storage.local.get(
   ["proofProvider", "proofKeys", "proofModels", "anthropicApiKey", "proofRules", "videoFolderName",
-   "orFreeModels", "orFreeModelsAt", "geminiModels", "geminiModelsAt"],
+   "watermarkKeywords", "orFreeModels", "orFreeModelsAt", "geminiModels", "geminiModelsAt"],
   (res) => {
     if (res.proofKeys) proofKeys = { ...proofKeys, ...res.proofKeys };
     if (res.proofModels) proofModels = { ...proofModels, ...res.proofModels };
@@ -274,6 +275,7 @@ chrome.storage.local.get(
       || (proofKeys.gemini ? "gemini" : proofKeys.openrouter ? "openrouter" : "gemini");
     if (res.proofRules) proofRulesEl.value = res.proofRules;
     if (res.videoFolderName) videoFolderNameEl.value = res.videoFolderName;
+    if (res.watermarkKeywords) watermarkKeywordsEl.value = res.watermarkKeywords;
     syncProviderUI();
   }
 );
@@ -307,6 +309,9 @@ resetRulesBtn.addEventListener("click", () => {
 });
 videoFolderNameEl.addEventListener("input", () => {
   chrome.storage.local.set({ videoFolderName: videoFolderNameEl.value.trim() });
+});
+watermarkKeywordsEl.addEventListener("input", () => {
+  chrome.storage.local.set({ watermarkKeywords: watermarkKeywordsEl.value.trim() });
 });
 
 saveKeyBtn.addEventListener("click", () => {
@@ -493,7 +498,12 @@ runBtn.addEventListener("click", async () => {
   const size = parseInt(document.getElementById("size").value, 10);
   const threshold = parseInt(document.getElementById("threshold").value, 10);
 
-  const valid = (n) => n >= 1 && n <= 800;
+  const valid = (n) => Number.isInteger(n) && n >= 1 && n <= 800;
+  if (!valid(threshold)) {
+    statusEl.textContent = "请输入有效的阈值（1–800）。";
+    return;
+  }
+
   let split = null;
   if (splitModeEl.checked) {
     split = {
@@ -651,7 +661,12 @@ applyPosBtn.addEventListener("click", async () => {
 runComboBtn.addEventListener("click", async () => {
   const size = parseInt(document.getElementById("size").value, 10);
   const threshold = parseInt(document.getElementById("threshold").value, 10);
-  const valid = (n) => n >= 1 && n <= 800;
+  const valid = (n) => Number.isInteger(n) && n >= 1 && n <= 800;
+  if (!valid(threshold)) {
+    statusEl.textContent = "请输入有效的阈值（1–800）。";
+    return;
+  }
+
   let split = null;
   if (splitModeEl.checked) {
     split = {
@@ -689,27 +704,11 @@ runComboBtn.addEventListener("click", async () => {
   logEl.textContent = "";
   document.getElementById("needFixBanner").style.display = "none";
 
-  log("== 第 1/3 步：调整字号 ==");
-  statusEl.textContent = "第 1/3 步：调整字号…";
-  await runComboStep({ type: "run", tabId: tab.id, size, threshold, allPages, split });
-
-  if (!comboCancelled) {
-    if (x && y) {
-      log("\n== 第 2/3 步：统一位置 ==");
-      statusEl.textContent = "第 2/3 步：统一位置…";
-      await runComboStep({ type: "set-position", tabId: tab.id, x, y, allPages });
-    } else {
-      log("\n（未填写位置坐标，跳过统一位置这一步）");
-    }
-  }
-
-  if (!comboCancelled) {
-    log("\n== 第 3/3 步：套用高亮动画 ==");
-    statusEl.textContent = "第 3/3 步：套用高亮动画…";
-    await runComboStep({ type: "animate", tabId: tab.id, color, allPages });
-  }
+  // 三步合进一个 combo 任务：后台在【同一个 debugger 会话】里依次跑 字号→位置→高亮，
+  // 只 attach/detach 一次，从根上消除三步各自 attach 的竞态。步骤日志/状态由后台推送。
+  const okAll = await runComboStep({ type: "combo", tabId: tab.id, size, threshold, split, x, y, color, allPages });
 
   activePort = null;
-  statusEl.textContent = comboCancelled ? "⛔ 已停止。" : "✅ 全部完成。";
+  statusEl.textContent = comboCancelled ? "⛔ 已停止。" : (okAll ? "✅ 全部完成。" : "⚠️ 已完成，但有失败项（见日志）。");
   setBusy(false);
 });

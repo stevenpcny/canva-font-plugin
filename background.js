@@ -80,6 +80,11 @@ function makeRunner(tabId, port, state) {
     await cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 });
   }
 
+  async function pressBackspace() {
+    await cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    await cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+  }
+
   async function doubleClickAt(x, y) {
     await cmd("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
     await cmd("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
@@ -186,48 +191,96 @@ function makeRunner(tabId, port, state) {
     }
   }
 
-  // 取第 i 页缩略图中心坐标（先滚动到可见）
-  // 注意：aria-label="Page N" 可能同时命中无障碍镜像树的折叠节点（rect 恒为 0），必须限定 role=button 取真实缩略图。
-  // 中文界面实测格式为 "第N页"（无空格，非简单替换），需双语候选。
+  // 取第 i 页可点击区域中心坐标（先滚动到可见）。
+  // Canva 有两种真实结构：时间轴缩略图直接是 role=button；Pages 堆叠视图则把
+  // aria-label="Page N" 放在 0×0 的无障碍 group 上，真实页面是其上方第一个
+  // 有尺寸的祖先容器。2026-07-13 实测点击该祖先后页码会从 1/14 变为 2/14。
   function getPageThumbRect(i) {
     return evaluate(`(() => {
-      const el = [...document.querySelectorAll('[aria-label="Page ${i}"], [aria-label="第${i}页"]')].find(e => e.getAttribute('role') === 'button');
-      if (!el) return null;
-      el.scrollIntoView({ block: 'nearest', inline: 'center' });
-      const r = el.getBoundingClientRect();
+      const matches = [...document.querySelectorAll('[aria-label="Page ${i}"], [aria-label="第${i}页"], [aria-label="第 ${i} 页"]')];
+      let target = matches.find(e => {
+        const r = e.getBoundingClientRect();
+        return e.getAttribute('role') === 'button' && r.width > 5 && r.height > 5;
+      });
+      if (!target) {
+        for (const match of matches) {
+          let el = match;
+          for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 100 && r.height > 100) { target = el; break; }
+          }
+          if (target) break;
+        }
+      }
+      if (!target) return null;
+      target.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = target.getBoundingClientRect();
       return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2), w: r.width };
     })()`);
   }
 
+  // 内置水印关键词：用户自加的水印文案里常见的固定措辞（大小写不敏感、允许连字符/空格变体）
+  const BUILTIN_WATERMARK_KEYWORDS = ["ai generated", "ai-generated", "elevenlabs"];
+
   // 枚举当前页画布区域内的文字元素（中心坐标 + 显示字号 px）
-  function enumerateTexts() {
+  async function enumerateTexts() {
+    const stored = await chrome.storage.local.get(["watermarkKeywords"]);
+    const userKeywords = (stored.watermarkKeywords || "")
+      .split(/[,，\n]/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const keywords = [...BUILTIN_WATERMARK_KEYWORDS, ...userKeywords];
     return evaluate(`(() => {
       const frame = ${CANVAS_FRAME_EXPR};
       if (!frame) return [];
+      const keywords = ${JSON.stringify(keywords)};
       // 阈值用 10px 而非 0：字幕的非当前时刻副本会塌缩成近似 0 宽/高（如 w=0.35），
       // 单纯 width>0 挡不住这类假阳性，必须要求有意义的可视尺寸
-      const inDesign = (r) => r.width>10 && r.height>10 &&
-        r.left>=frame.left-2 && r.right<=frame.right+2 &&
-        r.top>=frame.top-2 && r.bottom<=frame.bottom+2;
+      const visiblePart = (r) => ({
+        left: Math.max(r.left, frame.left), right: Math.min(r.right, frame.right),
+        top: Math.max(r.top, frame.top), bottom: Math.min(r.bottom, frame.bottom),
+      });
+      const inDesign = (r) => {
+        const v = visiblePart(r);
+        return v.right - v.left > 10 && v.bottom - v.top > 10;
+      };
       const seen = new Set(), items = [];
       for (const p of document.querySelectorAll('p')) {
         const txt = (p.textContent||'').trim();
         if (!txt) continue;
+        if (keywords.some((k) => k && txt.toLowerCase().includes(k))) continue;
         const r = p.getBoundingClientRect();
         if (!inDesign(r)) continue;
         const fpx = parseFloat(getComputedStyle(p).fontSize);
         if (!(fpx >= 20)) continue;
+        // 用户自加的水印文本框常通过父级 CSS transform 整体缩小显示，
+        // computed fontSize 读不出这个缩放，但 getBoundingClientRect 会带上——
+        // 真实字幕的可视高度通常接近字号（比例 ~0.6+），水印这类被缩小的框比例明显更低
+        if (r.height < fpx * 0.3) continue;
         const key = Math.round(r.x)+','+Math.round(r.y);
         if (seen.has(key)) continue;
         seen.add(key);
+        const v = visiblePart(r);
         items.push({
           text: txt.slice(0, 24),
           fontPx: fpx,
-          cx: Math.round(r.x + r.width/2),
-          cy: Math.round(r.y + r.height/2),
+          cx: Math.round((v.left + v.right) / 2),
+          cy: Math.round((v.top + v.bottom) / 2),
         });
       }
       return items;
+    })()`);
+  }
+
+  // 视频页设计在【选中视频片段后】会在画布上叠加播放器控件（role="group"，
+  // 英文 aria-label="Video controls"、中文="视频控制"，2026-07-10 双语实测同为 428x760）。
+  // 点击 enumerateTexts() 枚举出的坐标前必须先排查是否落在这个控件上——命中的话
+  // 点到的其实是播放/暂停按钮而非目标文字，选中的元素、读到的位置/字号都不可信。
+  // 注意中文是"视频控制"不是"视频控件"；此前只有英文候选 ⇒ 中文界面下该保护恒失效。
+  function isOnVideoControls(cx, cy) {
+    return evaluate(`(() => {
+      const el = document.elementFromPoint(${cx}, ${cy});
+      return !!(el && el.closest('[aria-label="Video controls"], [aria-label="视频控制"]'));
     })()`);
   }
 
@@ -299,6 +352,70 @@ function makeRunner(tabId, port, state) {
     })()`);
   }
 
+  // Animate 按钮的 aria-label 随元素动画状态变化，2026-07-10 Playwright 实测三态：
+  //   未套动画  "Animate"            / "动效"
+  //   已套动画  "Animation applied"  / "动效已应用"
+  //   面板已开  "Animation applied; Panel open" / "动效已应用；面板已开启"（中文全角分号）
+  // 精确匹配 "Animate"/"动效" 在已高亮的字幕上必然落空 → 重跑改色会整轮 no-animate-btn。
+  // 故按前缀匹配，并回报 panelOpen：面板已开时再点是收起面板，禁止点击。
+  function findAnimateButton() {
+    return evaluate(`(() => {
+      const PREFIXES = ["Animate", "动效", "Animation applied", "动效已应用"];
+      const b = [...document.querySelectorAll('button[aria-label]')]
+        .find(x => PREFIXES.some(p => x.getAttribute('aria-label').startsWith(p)));
+      if (!b) return null;
+      const label = b.getAttribute('aria-label');
+      const r = b.getBoundingClientRect();
+      return {
+        cx: Math.round(r.x + r.width/2),
+        cy: Math.round(r.y + r.height/2),
+        label,
+        panelOpen: /Panel open|面板已开启/.test(label),
+      };
+    })()`);
+  }
+
+  // 窄窗口（2026-07-11 Playwright 实测：视口 ≤ ~880px 且选中文本时）顶部文字工具栏溢出，
+  // Animate/Position 等右侧按钮折叠进 aria-label="Open more controls for selected element"
+  // 的溢出按钮 —— 此时字号框仍在（校准能过 no-caption-selected 却报 no-animate-btn 的根因）。
+  // 展开后按钮出现在工具栏第二行（top<120 不变），后续查找/点击逻辑完全复用。
+  // 中文 aria-label 未实测（账号语言是英文），"更多控" 为猜测候选：未命中只是不点击、无副作用，
+  // 命中范围限定工具栏区（top<120）防误点。
+  function findMoreControlsButton() {
+    return evaluate(`(() => {
+      const b = [...document.querySelectorAll('button[aria-label]')].find(x => {
+        const l = x.getAttribute('aria-label');
+        if (!(l.startsWith('Open more controls') || l.includes('更多控'))) return false;
+        const r = x.getBoundingClientRect();
+        return r.top < 120 && r.width > 0;
+      });
+      if (!b) return null;
+      const r = b.getBoundingClientRect();
+      return { cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) };
+    })()`);
+  }
+
+  // 打开动画面板并返回 Highlight 开关状态。面板已开却读不到开关 = 选中的不是字幕
+  // （或 Canva 改版），此时不能再点按钮（会收起面板）。
+  async function openAnimatePanelAndReadHighlight() {
+    let hl = await readHighlightSwitch();
+    if (hl.present) return { hl };
+    let ab = await findAnimateButton();
+    if (!ab) {
+      const more = await findMoreControlsButton();
+      if (more) {
+        await clickAt(more.cx, more.cy);
+        await sleep(400);
+        ab = await findAnimateButton();
+      }
+    }
+    if (!ab) return { hl, reason: "no-animate-btn" };
+    if (ab.panelOpen) return { hl, reason: "not-caption" };
+    await clickAt(ab.cx, ab.cy);
+    await sleep(700);
+    return { hl: await readHighlightSwitch() };
+  }
+
   // Captions 区的 Highlight 开关（存在即说明选中的是字幕）
   // 中文界面实测该动效预设名为 "强调"（Canva 翻译选择，非字面直译，非常规词典可猜）
   function readHighlightSwitch() {
@@ -336,14 +453,9 @@ function makeRunner(tabId, port, state) {
   // 给当前选中的字幕套 Highlight 动画并设颜色（hex 不含 #）
   async function setAnimationColorForSelected(hexNoHash) {
     // 若动画面板未显示 Highlight，则点 Animate 打开
-    let hl = await readHighlightSwitch();
-    if (!hl.present) {
-      const ab = await findByAria(["Animate", "动效"]);
-      if (!ab) return { applied: false, reason: "no-animate-btn" };
-      await clickAt(ab.cx, ab.cy);
-      await sleep(700);
-      hl = await readHighlightSwitch();
-    }
+    const opened = await openAnimatePanelAndReadHighlight();
+    const hl = opened.hl;
+    if (opened.reason === "no-animate-btn") return { applied: false, reason: "no-animate-btn" };
     if (!hl.present) return { applied: false, reason: "not-caption" };
 
     // 只在未选中时才点 Highlight（已选中再点会取消）
@@ -383,6 +495,12 @@ function makeRunner(tabId, port, state) {
 
     for (const t of texts) {
       if (state.cancelled) break;
+      if (await isOnVideoControls(t.cx, t.cy)) {
+        await waitForUserFix(`「${t.text}」被视频播放器控件遮挡，无法点击选中，请手动暂停视频或拖动播放头后重试`);
+        if (state.cancelled) break;
+        errors++;
+        continue;
+      }
       await clickAt(t.cx, t.cy);
       await sleep(300);
       const res = await setAnimationColorForSelected(hexNoHash);
@@ -414,49 +532,34 @@ function makeRunner(tabId, port, state) {
       if (state.cancelled) break;
       const label = text.slice(0, 20);
 
-      if (!(await openCaptionsPanel())) {
-        await waitForUserFix(`无法打开字幕面板：「${label}」`);
+      const sel = await selectCaptionSegment(page, text);
+      if (sel.reason !== "ok") {
+        const msg = {
+          "no-panel": `无法打开字幕面板：「${label}」`,
+          "no-line": `转录面板未找到「${label}」`,
+          "not-selected": `「${label}」未能选中`,
+        }[sel.reason];
+        await waitForUserFix(msg);
         if (state.cancelled) break;
         errors++;
+        await pressEscape();
+        await sleep(150);
         continue;
       }
-      await sleep(250);
-      const line = await findTranscriptLine(page, text);
-      if (!line) {
-        await waitForUserFix(`转录面板未找到「${label}」`);
-        if (state.cancelled) break;
-        errors++;
-        continue;
-      }
-      await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 选中该段
-      await sleep(600);
-      let f = await readFontField();
-      if (!f || !f.present || isNaN(f.value)) {
-        // 转录点击未带出选中态 → 在画布上点渲染出来的该段
-        const cap = await findRenderedCaption(text);
-        if (cap && cap.ok) {
-          await clickAt(cap.cx, cap.cy);
-          await sleep(300);
-          f = await readFontField();
-        }
-      }
-      if (!f || !f.present || isNaN(f.value)) {
-        await waitForUserFix(`「${label}」未能选中`);
-        if (state.cancelled) break;
-        errors++;
+
+      const res = await setAnimationColorForSelected(hexNoHash);
+      if (res.applied) {
+        log(`  ✓ 「${label}」高亮色 → #${hexNoHash}`);
+        changed++;
       } else {
-        const res = await setAnimationColorForSelected(hexNoHash);
-        if (res.applied) {
-          log(`  ✓ 「${label}」高亮色 → #${hexNoHash}`);
-          changed++;
-        } else if (res.reason === "not-caption") {
-          log(`  · 跳过「${label}」（非字幕）`);
-          skipped++;
-        } else {
-          await waitForUserFix(`「${label}」失败（${res.reason}）`);
-          if (state.cancelled) break;
-          errors++;
-        }
+        // 转录来的段一定是字幕：not-caption 只可能是没选中或 Highlight 开关选择器失效，
+        // 不能当"非字幕"静默跳过（那正是整份设计静默失败的根因）。一律暂停等用户处理。
+        const why = res.reason === "not-caption"
+          ? "未读到 Highlight/强调 开关（可能没选中，或 Canva 改版了动画面板）"
+          : res.reason;
+        await waitForUserFix(`「${label}」失败：${why}`);
+        if (state.cancelled) break;
+        errors++;
       }
       await pressEscape();
       await sleep(150);
@@ -464,14 +567,66 @@ function makeRunner(tabId, port, state) {
     return { changed, skipped, errors };
   }
 
-  async function runAnimate(color, allPages) {
+  // 动画面板诊断快照：改版排查用。列出当前所有 role="switch" 的文案，以及
+  // Animate/Color 按钮是否还在，方便对照插件写死的选择器判断 Canva 改了哪个控件。
+  function dumpAnimDiag() {
+    return evaluate(`(() => {
+      const switches = [...document.querySelectorAll('button[role="switch"]')]
+        .map(x => (x.textContent||'').trim()).filter(Boolean);
+      // Animate 按钮三态：直接回报实际 aria-label，改版时能一眼看出文案变成了什么
+      const PREFIXES = ["Animate", "动效", "Animation applied", "动效已应用"];
+      const ab = [...document.querySelectorAll('button[aria-label]')]
+        .find(x => PREFIXES.some(p => x.getAttribute('aria-label').startsWith(p)));
+      const moreBtn = [...document.querySelectorAll('button[aria-label]')].find(x => {
+        const l = x.getAttribute('aria-label');
+        const r = x.getBoundingClientRect();
+        return (l.startsWith('Open more controls') || l.includes('更多控')) && r.top < 120 && r.width > 0;
+      });
+      return {
+        switches,
+        hasAnimate: !!ab,
+        animateLabel: ab ? ab.getAttribute('aria-label') : null,
+        hasColor: !!document.querySelector('button[aria-label="Color"], button[aria-label="颜色"]'),
+        hasMoreControls: !!moreBtn,
+      };
+    })()`);
+  }
+
+  // 预检校准：进入翻页循环前，拿第一段【已知字幕】验证 Animate→Highlight 这条链是否还命中。
+  // 转录来的段 100% 是字幕，若在它身上都读不到 Highlight/强调 开关，只能是 Canva 改版了
+  // 动画面板 —— 此时必须整轮中止并报可诊断信息，而不是让循环把每一页都静默"跳过"
+  // （readHighlightSwitch 找不到开关 → setAnimationColorForSelected 返回 not-caption →
+  //  旧逻辑当"非字幕"跳过，导致整份设计静默失败）。
+  // 非破坏性：只点开 Animate 面板读开关存在性，不启用高亮、不改颜色。返回 { ok, reason }。
+  async function calibrateHighlightPath(captionsByPage) {
+    // 1) 选中第一段已知字幕（复刻 adjustPageCaptionAnimSegs 的选中逻辑）
+    const firstPage = [...captionsByPage.keys()].sort((a, b) => a - b)[0];
+    const firstText = captionsByPage.get(firstPage)[0];
+    if (!(await openCaptionsPanel())) return { ok: false, reason: "no-captions-panel" };
+    await sleep(250);
+    const line = await findTranscriptLine(firstPage, firstText);
+    if (!line) return { ok: false, reason: "no-transcript-line" };
+    await clickAt(line.cx, line.cy);
+    await sleep(600);
+    let f = await readFontField();
+    if (!f || !f.present || isNaN(f.value)) {
+      const cap = await findRenderedCaption(firstText);
+      if (cap && cap.ok) { await clickAt(cap.cx, cap.cy); await sleep(300); f = await readFontField(); }
+    }
+    if (!f || !f.present || isNaN(f.value)) return { ok: false, reason: "no-caption-selected" };
+
+    // 2) 打开 Animate 面板并断言 Highlight/强调 开关存在
+    const opened = await openAnimatePanelAndReadHighlight();
+    if (opened.reason === "no-animate-btn") return { ok: false, reason: "no-animate-btn" };
+    if (!opened.hl.present) return { ok: false, reason: "no-highlight-switch" };
+    return { ok: true };
+  }
+
+  // 高亮核心：不 attach/detach、不发 done，返回 ok（errors===0）。供 runAnimate 包装与 runCombo 复用。
+  async function animateCore(color, allPages) {
     const hexNoHash = String(color).replace(/^#/, "").toUpperCase();
     let changed = 0, skipped = 0, errors = 0;
-    try {
-      await chrome.debugger.attach(target, "1.3");
-      await cmd("Runtime.enable");
-      await warnIfNoOverlay();
-
+    {
       const info = await readPageInfo();
 
       // 有原生字幕的设计：先读一次转录面板，拿到每页的全部字幕段，
@@ -490,12 +645,40 @@ function makeRunner(tabId, port, state) {
 
       log(`高亮动画颜色 #${hexNoHash}。`);
 
-      if (allPages && !info) {
-        if (!captionsByPage) {
-          log("未能打开 Captions 转录面板，无法枚举全部页（当前设计可能没有 Canva 原生字幕）。");
-          send("done", { ok: false });
-          return;
+      // 高亮只对原生字幕有效；无论全页还是当前页，只要读不到转录面板就不能
+      // 安全区分字幕与普通文字。必须显式失败，禁止返回“完成：上色 0 处”。
+      if (!captionsByPage) {
+        log("✗ 未能读到 Captions 转录面板，无法确认原生字幕。");
+        log("  高亮只对原生字幕有效，已中止，未改动任何页面。");
+        return false;
+      }
+
+      // 预检校准：多页+有原生字幕时先验证 Highlight 链路，坏了就整轮中止，避免逐页静默失败。
+      // 只在 allPages 下做：校准会点转录首行把画布定位到第 1 页，单页模式不翻页会误处理错页；
+      // 且单页跑完立刻能看到"上色 0 处"，无需预检。无原生字幕的设计也跳过（画布首个文字
+      // 未必是字幕，无可靠校准基准）。
+      if (allPages && captionsByPage) {
+        const cal = await calibrateHighlightPath(captionsByPage);
+        if (!cal.ok) {
+          const reasonText = {
+            "no-captions-panel": "打不开字幕转录面板",
+            "no-transcript-line": "转录面板里定位不到首段字幕",
+            "no-caption-selected": "选中首段字幕失败",
+            "no-animate-btn": "找不到 Animate/动效 按钮",
+            "no-highlight-switch": "选中了字幕但读不到 Highlight/强调 开关（Canva 动画面板可能已改版）",
+          }[cal.reason] || cal.reason;
+          const diag = await dumpAnimDiag();
+          log(`✗ 校准失败：${reasonText}。已中止，未改动任何页面。`);
+          log(`  诊断：Animate 按钮=${diag.hasAnimate ? `在（aria-label="${diag.animateLabel}"）` : "缺"}，工具栏溢出按钮=${diag.hasMoreControls ? "在（窗口太窄按钮被折叠？）" : "无"}，当前 switch 文案=${JSON.stringify(diag.switches)}`);
+          return false;
         }
+        log("✓ 校准通过：Highlight/强调 链路命中，开始批量上色。");
+        await pressEscape();
+        await sleep(150);
+      }
+
+      if (allPages && !info) {
+        // captionsByPage 非空由上方「无原生字幕即中止」前置检查保证
         const pages = [...captionsByPage.keys()].sort((a, b) => a - b);
         log(`所有页（共 ${pages.length} 页，经字幕面板确认）。`);
         for (const p of pages) {
@@ -516,21 +699,24 @@ function makeRunner(tabId, port, state) {
           if (state.cancelled) break;
           send("status", { text: `第 ${i} / ${total} 页…` });
 
-          if (allPages) {
+          // 有转录字幕的页直接点转录行完成翻页；Duration/Reel 视图可能有 N/M
+          // 页码但没有缩略图，不能在处理字幕前强制依赖 navigateToPage()。
+          const transcriptPage = captionsByPage && captionsByPage.has(i) ? i : null;
+          if (allPages && transcriptPage == null) {
             if (!(await navigateToPage(i))) {
               await waitForUserFix(`第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图）`);
               if (state.cancelled) break;
               errors++;
               continue;
             }
+            await sleep(400);
           }
-          await sleep(400);
 
           // 本页有字幕段则走转录面板逐段处理；否则（经典无字幕设计/该页无匹配字幕）
           // 退回画布枚举（只能处理播放头当前渲染的那一段，但这类设计本来就只有一段）
           let handledViaTranscript = false;
           if (captionsByPage) {
-            let capPage = info && captionsByPage.has(i) ? i : null;
+            let capPage = transcriptPage;
             if (capPage == null) capPage = await findCurrentCaptionPage(captionsByPage);
             if (capPage != null && captionsByPage.has(capPage)) {
               const s = await adjustPageCaptionAnimSegs(capPage, captionsByPage.get(capPage), hexNoHash);
@@ -548,12 +734,23 @@ function makeRunner(tabId, port, state) {
       }
 
       log(`\n完成：上色 ${changed} 处，跳过 ${skipped} 处，失败 ${errors} 处。`);
-      send("done", { ok: errors === 0 });
+      return errors === 0;
+    }
+  }
+
+  async function runAnimate(color, allPages) {
+    let ok = false;
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      await cmd("Runtime.enable");
+      await warnIfNoOverlay();
+      ok = await animateCore(color, allPages);
     } catch (e) {
       log("运行出错：" + (e && e.message ? e.message : String(e)));
-      send("done", { ok: false });
+      ok = false;
     } finally {
       try { await chrome.debugger.detach(target); } catch (_) {}
+      send("done", { ok });
     }
   }
 
@@ -564,6 +761,7 @@ function makeRunner(tabId, port, state) {
   // 遮挡或读到上一个元素残留值而误判的问题。
   async function calibrateScale(texts) {
     for (const t of texts) {
+      if (await isOnVideoControls(t.cx, t.cy)) continue;
       await clickAt(t.cx, t.cy);
       await sleep(300);
       const f = await readFontField();
@@ -580,6 +778,12 @@ function makeRunner(tabId, port, state) {
   // 悬浮工具条只会挡在目标框上方，若核对失败，向下偏移坐标重试一次，仍失败则
   // 明确跳过（不再像旧逻辑那样盲信点击后读到的值）。
   async function clickAndVerify(t, expectedReal, retried) {
+    if (await isOnVideoControls(t.cx, t.cy)) {
+      if (!retried) {
+        return clickAndVerify({ ...t, cy: t.cy + 10 }, expectedReal, true);
+      }
+      return { ok: false, reason: "点击目标被视频播放器控件遮挡（为避免误触发播放/暂停，已跳过点击）" };
+    }
     await clickAt(t.cx, t.cy);
     await sleep(300);
     const f = await readFontField();
@@ -609,10 +813,17 @@ function makeRunner(tabId, port, state) {
   // >= boundary 视为标题改 titleSize，否则视为正文改 bodySize。
   // 真实字号来自 calibrateScale 换算，而非逐个点击读值（画布缩放会让渲染
   // px 与真实值不一致，且逐个点击易被悬浮工具条遮挡导致误判）。
-  async function adjustCurrentPageTexts(pageLabel, size, threshold, split) {
+  async function adjustCurrentPageTexts(pageLabel, size, threshold, split, excludeTexts = []) {
     let changed = 0, skipped = 0, errors = 0;
-    const texts = await enumerateTexts();
-    log(`${pageLabel}：发现 ${texts.length} 个文字元素。`);
+    const textKey = (s) => String(s || "").normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+    const excludeKeys = excludeTexts.map(textKey).filter(Boolean);
+    const allTexts = await enumerateTexts();
+    const texts = allTexts.filter((t) => {
+      const key = textKey(t.text);
+      return !key || !excludeKeys.some((excluded) => excluded.startsWith(key) || key.startsWith(excluded));
+    });
+    const excludedCount = allTexts.length - texts.length;
+    log(`${pageLabel}：发现 ${texts.length} 个文字元素${excludedCount ? `（另有 ${excludedCount} 个字幕已由转录面板处理）` : ""}。`);
     if (texts.length === 0) return { changed, skipped, errors };
 
     const scale = await calibrateScale(texts);
@@ -723,37 +934,22 @@ function makeRunner(tabId, port, state) {
         }
       }
 
-      if (!(await openCaptionsPanel())) {
-        await waitForUserFix(`无法打开字幕面板：「${label}」`);
+      const sel = await selectCaptionSegment(page, text);
+      if (sel.reason !== "ok") {
+        const msg = {
+          "no-panel": `无法打开字幕面板：「${label}」`,
+          "no-line": `转录面板未找到「${label}」`,
+          "not-selected": `「${label}」未能选中`,
+        }[sel.reason];
+        await waitForUserFix(msg);
         if (state.cancelled) break;
         errors++;
+        await pressEscape();
+        await sleep(150);
         continue;
       }
-      await sleep(250);
-      const line = await findTranscriptLine(page, text);
-      if (!line) {
-        await waitForUserFix(`转录面板未找到「${label}」`);
-        if (state.cancelled) break;
-        errors++;
-        continue;
-      }
-      await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 选中该段
-      await sleep(600);
-      let f = await readFontField();
-      if (!f || !f.present || isNaN(f.value)) {
-        // 转录点击未带出字号框 → 在画布上点渲染出来的该段
-        const cap = await findRenderedCaption(text);
-        if (cap && cap.ok) {
-          await clickAt(cap.cx, cap.cy);
-          await sleep(300);
-          f = await readFontField();
-        }
-      }
-      if (!f || !f.present || isNaN(f.value)) {
-        await waitForUserFix(`「${label}」未能选中`);
-        if (state.cancelled) break;
-        errors++;
-      } else if (f.value < threshold) {
+      const f = sel.f;
+      if (f.value < threshold) {
         log(`  · 跳过「${label}」（当前 ${f.value} < 阈值 ${threshold}）`);
         skipped++;
       } else {
@@ -803,16 +999,13 @@ function makeRunner(tabId, port, state) {
     return null;
   }
 
-  async function run(size, threshold, allPages, split) {
+  // 字号核心：不 attach/detach、不发 done，返回 ok（errors===0）。供 run 包装与 runCombo 复用。
+  async function fontCore(size, threshold, allPages, split) {
     let changed = 0, skipped = 0, errors = 0;
     const goalDesc = split
       ? `标题(≥${split.boundary}) → ${split.titleSize}，正文 → ${split.bodySize}`
       : `目标字号 ${size}`;
-    try {
-      await chrome.debugger.attach(target, "1.3");
-      await cmd("Runtime.enable");
-      await warnIfNoOverlay();
-
+    {
       const info = await readPageInfo();
 
       // 有原生字幕的设计：先读一次转录面板，拿到每页的全部字幕段。
@@ -832,8 +1025,7 @@ function makeRunner(tabId, port, state) {
       if (allPages && !info) {
         if (!captionsByPage) {
           log("未能打开 Captions 转录面板，无法枚举全部页（当前设计可能没有 Canva 原生字幕）。");
-          send("done", { ok: false });
-          return;
+          return false;
         }
         const pages = [...captionsByPage.keys()].sort((a, b) => a - b);
         log(`所有页（共 ${pages.length} 页，经字幕面板确认），${goalDesc}，阈值 ≥ ${threshold}。`);
@@ -843,7 +1035,7 @@ function makeRunner(tabId, port, state) {
           const s = await adjustPageCaptionSegs(p, captionsByPage.get(p), size, threshold, split);
           changed += s.changed; skipped += s.skipped; errors += s.errors;
           // 逐段点完后播放头已停在本页 → 再按画布枚举处理本页静态文字（标题/正文等）
-          const r = await adjustCurrentPageTexts(`第 ${p} 页（画布静态文字）`, size, threshold, split);
+          const r = await adjustCurrentPageTexts(`第 ${p} 页（画布静态文字）`, size, threshold, split, captionsByPage.get(p));
           changed += r.changed; skipped += r.skipped; errors += r.errors;
           await pressEscape();
           await sleep(150);
@@ -859,27 +1051,33 @@ function makeRunner(tabId, port, state) {
           if (state.cancelled) break;
           send("status", { text: `第 ${i} / ${total} 页…` });
 
-          if (allPages) {
+          // 有转录字幕的页不依赖缩略图翻页：adjustPageCaptionSegs 点转录行时会让
+          // Canva 自动定位到对应页。Duration 视图偶尔也会暴露 "N/M" 文本，若仍
+          // 强制走缩略图分支，会误判成经典设计并在第 2 页暂停。
+          const transcriptPage = captionsByPage && captionsByPage.has(i) ? i : null;
+          if (allPages && transcriptPage == null) {
             if (!(await navigateToPage(i))) {
               await waitForUserFix(`第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图）`);
               if (state.cancelled) break;
               errors++;
               continue;
             }
+            await sleep(400);
           }
-          await sleep(400);
 
-          // 本页有字幕段则先经转录面板逐段补齐（Duration 视图等 info 可读的视频设计）
+          // 本页有字幕段则先经转录面板逐段补齐；选中第一段同时完成翻页。
+          let handledCaptionLines = [];
           if (captionsByPage) {
-            let capPage = info && captionsByPage.has(i) ? i : null;
+            let capPage = transcriptPage;
             if (capPage == null) capPage = await findCurrentCaptionPage(captionsByPage);
             if (capPage != null && captionsByPage.has(capPage)) {
-              const s = await adjustPageCaptionSegs(capPage, captionsByPage.get(capPage), size, threshold, split);
+              handledCaptionLines = captionsByPage.get(capPage);
+              const s = await adjustPageCaptionSegs(capPage, handledCaptionLines, size, threshold, split);
               changed += s.changed; skipped += s.skipped; errors += s.errors;
             }
           }
 
-          const r = await adjustCurrentPageTexts(`第 ${i} 页${captionsByPage ? "（画布静态文字）" : ""}`, size, threshold, split);
+          const r = await adjustCurrentPageTexts(`第 ${i} 页${captionsByPage ? "（画布静态文字）" : ""}`, size, threshold, split, handledCaptionLines);
           changed += r.changed; skipped += r.skipped; errors += r.errors;
           await pressEscape();
           await sleep(150);
@@ -887,12 +1085,23 @@ function makeRunner(tabId, port, state) {
       }
 
       log(`\n完成：修改 ${changed} 处，跳过 ${skipped} 处，失败 ${errors} 处。`);
-      send("done", { ok: errors === 0 });
+      return errors === 0;
+    }
+  }
+
+  async function run(size, threshold, allPages, split) {
+    let ok = false;
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      await cmd("Runtime.enable");
+      await warnIfNoOverlay();
+      ok = await fontCore(size, threshold, allPages, split);
     } catch (e) {
       log("运行出错：" + (e && e.message ? e.message : String(e)));
-      send("done", { ok: false });
+      ok = false;
     } finally {
       try { await chrome.debugger.detach(target); } catch (_) {}
+      send("done", { ok });
     }
   }
 
@@ -903,21 +1112,70 @@ function makeRunner(tabId, port, state) {
   // 画布上同一页多条时间字幕堆叠在同一坐标、只有当前时刻那条可点，
   // 所以读取/应用都走这个面板，不再用画布坐标枚举（旧法每页只剩 1 条）。
 
-  function isCaptionsPanelOpen() {
-    return evaluate(`(() => {
+  // 字幕面板的中英双语文案（2026-07-10 Playwright 双语实测，设计 DAHO_UoXTvQ）：
+  //   工具栏按钮  "Captions"            / "字幕"
+  //   删除按钮    "Delete all captions" / "删除所有字幕"
+  //   页码标记 P  "Page 1"              / "第 1 页"（中文数字两侧带空格！）
+  //   Transcript/Styles 两个 tab 仅英文界面存在，中文界面直接展示转录内容、无 tab。
+  // 此前全部硬编码英文 → 中文界面下 openCaptionsPanel 必然失败，字号/高亮的
+  // 转录面板路径整条不可用。禁止改回单语字符串。
+  const CAP_L10N_JS = `
+    const CAP_DELETE_ALL = ['Delete all captions', '删除所有字幕'];
+    const CAP_SKIP = new Set(['Transcript', 'Styles', 'Delete all captions', 'Captions', '字幕', '删除所有字幕']);
+    const PAGE_RE = /^(?:Page\\s*|第\\s*)(\\d+)\\s*页?$/;      // 锚定：叶子是否页码标记
+    const PAGE_ANY = /(?:Page\\s*\\d+|第\\s*\\d+\\s*页)/;        // 非锚定：容器内是否含页码
+    const hasDeleteAll = (t) => CAP_DELETE_ALL.some(s => t.includes(s));
+    const pageNumOf = (t) => { const m = PAGE_RE.exec(t); return m ? parseInt(m[1], 10) : null; };
+    // 转录面板根容器：含"删除所有字幕"且含页码的最小 div
+    const findTranscriptRoot = () => {
+      let root = null, best = Infinity;
       for (const d of document.querySelectorAll('div')) {
         const t = d.textContent || '';
-        if (t.includes('Delete all captions') && /Page \\d+/.test(t)) return true;
+        if (hasDeleteAll(t) && PAGE_ANY.test(t)) {
+          const n = d.querySelectorAll('*').length;
+          if (n < best) { best = n; root = d; }
+        }
       }
-      return false;
+      return root;
+    };
+  `;
+
+  // 面板是否打开——tab 无关判定。"Delete all captions"/"删除所有字幕" 只在转录内容处有；
+  // 英文面板停在 Styles tab 时靠 Transcript+Styles 两个 tab 标签同时存在来识别，
+  // 否则会误判"没开"、进而把开着的面板 toggle 关掉（Captions 按钮是开关，实测确认）。
+  function isCaptionsPanelOpen() {
+    return evaluate(`(() => {
+      ${CAP_L10N_JS}
+      if (findTranscriptRoot()) return true;
+      const leaves = [...document.querySelectorAll('button,span,div')]
+        .filter(e => e.childElementCount === 0)
+        .map(e => (e.textContent || '').trim());
+      return leaves.includes('Transcript') && leaves.includes('Styles');
     })()`);
   }
 
-  // 顶部工具栏(顶端)里文本精确匹配的按钮中心坐标
-  function findToolbarButton(label) {
+  // readCaptionsTranscript / findTranscriptLine 只在 Transcript tab 能解析；面板若停在
+  // Styles tab（无 "Delete all captions"）则点一下 Transcript tab 切过去。
+  // 中文界面无 tab，转录内容直出：找不到 Transcript tab 时直接返回（原逻辑已容错）。
+  async function ensureCaptionsTranscriptTab() {
+    const onTranscript = await evaluate(`(() => { ${CAP_L10N_JS} return !!findTranscriptRoot(); })()`);
+    if (onTranscript) return;
+    const tab = await evaluate(`(() => {
+      const b = [...document.querySelectorAll('button,[role="tab"],span,div')].find(e => e.childElementCount <= 1 && (e.textContent || '').trim() === 'Transcript');
+      if (!b) return null;
+      const r = b.getBoundingClientRect();
+      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+    })()`);
+    if (tab) { await clickAt(tab.cx, tab.cy); await sleep(300); }
+  }
+
+  // 顶部工具栏(顶端)里文本精确匹配的按钮中心坐标。labelOrList 支持中英候选数组。
+  function findToolbarButton(labelOrList) {
+    const labels = Array.isArray(labelOrList) ? labelOrList : [labelOrList];
     return evaluate(`(() => {
+      const LABELS = ${JSON.stringify(labels)};
       const cands = [...document.querySelectorAll('button,div[role="button"],span')]
-        .filter(x => (x.textContent || '').trim() === ${JSON.stringify(label)});
+        .filter(x => LABELS.includes((x.textContent || '').trim()));
       const hit = cands.map(x => ({ x, r: x.getBoundingClientRect() }))
         .filter(o => o.r.top < 120 && o.r.width > 0)
         .sort((a, b) => a.r.x - b.r.x)[0];
@@ -931,57 +1189,78 @@ function makeRunner(tabId, port, state) {
   // 常见的顶部区域），固定点一个高度分数选不中字幕元素、工具栏就不会出现 Captions
   // 按钮。改为按多个高度分数依次尝试，命中第一个能找到 Captions 按钮的位置。
   async function openCaptionsPanel() {
-    if (await isCaptionsPanelOpen()) return true;
+    if (await isCaptionsPanelOpen()) { await ensureCaptionsTranscriptTab(); return true; }
     const frame = await evaluate(`(() => { const r = ${CANVAS_FRAME_EXPR}; return r ? {left:r.left, top:r.top, width:r.width, height:r.height} : null; })()`);
-    if (!frame) return false;
+    if (!frame) { log("  [诊断] openCaptionsPanel：找不到画布框（CANVAS_FRAME_EXPR 返回 null）"); return false; }
+    const diag = [];
+
+    // 优先点击画布上真实可见的文字候选。字幕框允许部分溢出画布；enumerateTexts
+    // 返回的是可见交集中心，避免点到右侧画布外。选中后出现字号框，才说明命中了
+    // 文字而不是视频，再点击文字工具栏里的 Captions 打开 Transcript。
+    const textCandidates = await enumerateTexts();
+    for (const t of textCandidates) {
+      await clickAt(t.cx, t.cy);
+      await sleep(350);
+      const font = await readFontField();
+      if (!font || !font.present) { await pressEscape(); await sleep(100); continue; }
+      const cap = await findToolbarButton(["Captions", "字幕"]);
+      if (!cap) { await pressEscape(); await sleep(100); continue; }
+      await clickAt(cap.cx, cap.cy);
+      let opened = false;
+      for (let wait = 0; wait < 10; wait++) {
+        await sleep(200);
+        if (await isCaptionsPanelOpen()) { opened = true; break; }
+      }
+      if (opened) { await ensureCaptionsTranscriptTab(); return true; }
+      diag.push(`文字候选「${t.text}」点了Captions但面板没开`);
+      await pressEscape();
+      await sleep(150);
+    }
+
     for (const frac of [0.4, 0.5, 0.6, 0.3, 0.7, 0.2, 0.8]) {
       const cx = Math.round(frame.left + frame.width / 2);
       const cy = Math.round(frame.top + frame.height * frac);
-      // 视频页设计会在画布中央叠加播放器控件（role="group" aria-label="Video controls"），
-      // 盲点高度分数探测字幕时如果落在这个控件上会点到播放/暂停按钮而不是字幕。
-      // 点击前先探测该坐标是否落在播放器控件内，命中则跳过这个分数不点。
-      const onVideoControls = await evaluate(`(() => {
-        const el = document.elementFromPoint(${cx}, ${cy});
-        return !!(el && el.closest('[aria-label="Video controls"]'));
-      })()`);
-      if (onVideoControls) continue;
+      // 盲点高度分数探测字幕时如果落在播放器控件上会点到播放/暂停按钮而不是字幕，
+      // 点击前先排查，命中则跳过这个分数不点。
+      if (await isOnVideoControls(cx, cy)) { diag.push(`${frac}:视频控件跳过`); continue; }
       await clickAt(cx, cy);
       await sleep(350);
-      const cap = await findToolbarButton("Captions");
+      const cap = await findToolbarButton(["Captions", "字幕"]);
       if (cap) {
         await clickAt(cap.cx, cap.cy);
-        await sleep(600);
-        if (await isCaptionsPanelOpen()) return true;
+        let opened = false;
+        for (let t = 0; t < 10; t++) {
+          await sleep(200);
+          if (await isCaptionsPanelOpen()) { opened = true; break; }
+        }
+        if (opened) { await ensureCaptionsTranscriptTab(); return true; }
+        diag.push(`${frac}:点了Captions按钮但面板没开`);
+      } else {
+        diag.push(`${frac}:无Captions按钮`);
       }
       await pressEscape();
       await sleep(150);
     }
+    log(`  [诊断] openCaptionsPanel 失败：frame=(${Math.round(frame.left)},${Math.round(frame.top)} ${Math.round(frame.width)}×${Math.round(frame.height)}) 各分数=[${diag.join(" | ")}]`);
     return false;
   }
 
   // 读取转录面板里全部字幕，按页返回 [{page, text}]（文档顺序）
   function readCaptionsTranscript() {
     return evaluate(`(() => {
-      let root = null, best = Infinity;
-      for (const d of document.querySelectorAll('div')) {
-        const t = d.textContent || '';
-        if (t.includes('Delete all captions') && /Page \\d+/.test(t)) {
-          const n = d.querySelectorAll('*').length;
-          if (n < best) { best = n; root = d; }
-        }
-      }
+      ${CAP_L10N_JS}
+      const root = findTranscriptRoot();
       if (!root) return [];
       const rr = root.getBoundingClientRect();
-      const skip = new Set(['Transcript', 'Styles', 'Delete all captions', 'Captions']);
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
       const out = []; let cur = null; const seen = new Set();
       while (walker.nextNode()) {
         const el = walker.currentNode;
         const t = (el.textContent || '').trim();
         const r = el.getBoundingClientRect();
-        const m = /^Page (\\d+)$/.exec(t);
-        if (m && el.childElementCount <= 1) { cur = parseInt(m[1], 10); continue; }
-        if (el.childElementCount === 0 && t && !skip.has(t) && !/^Page \\d+$/.test(t)
+        const pn = pageNumOf(t);
+        if (pn != null && el.childElementCount <= 1) { cur = pn; continue; }
+        if (el.childElementCount === 0 && t && !CAP_SKIP.has(t) && pageNumOf(t) == null
             && r.width > 40 && r.left >= rr.left - 2 && r.right <= rr.right + 2) {
           const key = cur + '|' + t;
           if (seen.has(key)) continue; seen.add(key);
@@ -995,28 +1274,21 @@ function makeRunner(tabId, port, state) {
   // 在转录面板里按「页号+文本」定位某条字幕，返回其中心坐标（点它会让 Canva 自动定位+选中该字幕）
   function findTranscriptLine(page, text) {
     return evaluate(`(() => {
+      ${CAP_L10N_JS}
       const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      let root = null, best = Infinity;
-      for (const d of document.querySelectorAll('div')) {
-        const t = d.textContent || '';
-        if (t.includes('Delete all captions') && /Page \\d+/.test(t)) {
-          const n = d.querySelectorAll('*').length;
-          if (n < best) { best = n; root = d; }
-        }
-      }
+      const root = findTranscriptRoot();
       if (!root) return null;
       const rr = root.getBoundingClientRect();
       const want = ${JSON.stringify(text)}.trim(), wantN = norm(want), wantPage = ${Number(page)};
-      const skip = new Set(['Transcript', 'Styles', 'Delete all captions', 'Captions']);
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
       let cur = null; let exactEl = null, fuzzyEl = null;
       while (walker.nextNode()) {
         const el = walker.currentNode;
         const t = (el.textContent || '').trim();
         const r = el.getBoundingClientRect();
-        const m = /^Page (\\d+)$/.exec(t);
-        if (m && el.childElementCount <= 1) { cur = parseInt(m[1], 10); continue; }
-        if (el.childElementCount === 0 && t && !skip.has(t) && !/^Page \\d+$/.test(t)
+        const pn = pageNumOf(t);
+        if (pn != null && el.childElementCount <= 1) { cur = pn; continue; }
+        if (el.childElementCount === 0 && t && !CAP_SKIP.has(t) && pageNumOf(t) == null
             && cur === wantPage && r.width > 40 && r.left >= rr.left - 2 && r.right <= rr.right + 2) {
           if (t === want) { exactEl = el; break; }
           if (!fuzzyEl && norm(t) === wantN) fuzzyEl = el;
@@ -1216,11 +1488,16 @@ ${lines}`;
     }
     if (!thumb) return false;
     await clickAt(thumb.cx, thumb.cy);
+    let pageChanged = false;
     for (let t = 0; t < 20; t++) {
       await sleep(150);
       const pi = await readPageInfo();
-      if (pi && pi.current === i) break;
+      if (pi && pi.current === i) {
+        pageChanged = true;
+        break;
+      }
     }
+    if (!pageChanged) return false;
     await sleep(400);
     return true;
   }
@@ -1719,42 +1996,60 @@ ${lines}`;
     })()`);
   }
 
+  // 往已定位的 X/Y 数字框写值：每次尝试先「反复全选+退格」清空并回读确认为空，再输入。
+  // 这样即便某次全选未生效，也不会把新值追加到旧值后（就是 108→108141.8 那个拼接 bug 的根因）。
+  // 输入后回读 == 期望才算成功；否则整段重试，最多 3 次。key: 'x' | 'y'。返回 { ok, actual }。
+  async function typeNumberInto(coords, value, key) {
+    const want = Math.round(Number(value));
+    const readCur = async () => {
+      const v = await readPositionValues();
+      return v ? (key === "x" ? v.x : v.y) : null;
+    };
+    let actual = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await clickAt(coords.cx, coords.cy);
+      await sleep(120);
+      // 清空到回读为空：单次全选偶发失效时，靠重复的全选+退格兜底
+      for (let c = 0; c < 6; c++) {
+        await pressSelectAll();
+        await sleep(50);
+        await pressBackspace();
+        await sleep(50);
+        const cur = await readCur();
+        if (cur === "" || cur == null) break;
+      }
+      await typeText(String(value));
+      await sleep(90);
+      actual = await readCur();
+      if (actual != null && Math.round(Number(actual)) === want) return { ok: true, actual };
+    }
+    return { ok: false, actual };
+  }
+
   async function setPositionForSelected(x, y) {
     const inputs = await getPositionInputCoords();
     if (!inputs) return { applied: false, reason: "no-position-inputs" };
 
-    // 设置 X：填入后先回读校验，符合预期才回车；回车后再回读确认已生效
-    await clickAt(inputs.X.cx, inputs.X.cy);
-    await sleep(100);
-    await pressSelectAll();
-    await sleep(60);
-    await typeText(String(x));
-    await sleep(60);
-    let checkX = await readPositionValues();
-    if (!checkX || Math.round(Number(checkX.x)) !== Math.round(Number(x))) {
-      return { applied: false, reason: "x-value-mismatch-before-enter", expected: x, actual: checkX && checkX.x };
+    // 设置 X：清空重试填入 + 回读校验，符合预期才回车；回车后再回读确认已生效
+    const rx = await typeNumberInto(inputs.X, x, "x");
+    if (!rx.ok) {
+      return { applied: false, reason: "x-value-mismatch-before-enter", expected: x, actual: rx.actual };
     }
     await pressEnter();
     await sleep(200);
-    checkX = await readPositionValues();
+    const checkX = await readPositionValues();
     if (!checkX || Math.round(Number(checkX.x)) !== Math.round(Number(x))) {
       return { applied: false, reason: "x-value-mismatch-after-enter", expected: x, actual: checkX && checkX.x };
     }
 
-    // 设置 Y：同样两段校验
-    await clickAt(inputs.Y.cx, inputs.Y.cy);
-    await sleep(100);
-    await pressSelectAll();
-    await sleep(60);
-    await typeText(String(y));
-    await sleep(60);
-    let checkY = await readPositionValues();
-    if (!checkY || Math.round(Number(checkY.y)) !== Math.round(Number(y))) {
-      return { applied: false, reason: "y-value-mismatch-before-enter", expected: y, actual: checkY && checkY.y };
+    // 设置 Y：同样清空重试 + 两段校验
+    const ry = await typeNumberInto(inputs.Y, y, "y");
+    if (!ry.ok) {
+      return { applied: false, reason: "y-value-mismatch-before-enter", expected: y, actual: ry.actual };
     }
     await pressEnter();
     await sleep(300);
-    checkY = await readPositionValues();
+    const checkY = await readPositionValues();
     if (!checkY || Math.round(Number(checkY.y)) !== Math.round(Number(y))) {
       return { applied: false, reason: "y-value-mismatch-after-enter", expected: y, actual: checkY && checkY.y };
     }
@@ -1785,7 +2080,17 @@ ${lines}`;
         return;
       }
 
-      const t = texts[0];
+      let t = null;
+      for (const cand of texts) {
+        if (await isOnVideoControls(cand.cx, cand.cy)) continue;
+        t = cand;
+        break;
+      }
+      if (!t) {
+        await waitForUserFix("当前页字幕元素都被视频播放器控件遮挡，无法点击选中，请手动暂停视频或拖动播放头后重试");
+        send("done", { ok: false });
+        return;
+      }
       await clickAt(t.cx, t.cy);
       await sleep(300);
       log(`选中「${t.text}」`);
@@ -1815,6 +2120,40 @@ ${lines}`;
   // 转录面板逐段设置位置：同一页可能有多段字幕，画布上只有播放头当前
   // 时刻那段会渲染（其余塌缩成 <1px，enumerateTexts 的 width>10 过滤会挡掉），
   // 必须逐段走转录面板点击，不能靠画布枚举一次性处理整页（见 arch_decisions #21 同根因）。
+  // 选中某页某段字幕：走转录面板点击带出选中态，偶发选不中时重试(重开面板→重定位→再点，
+  // 重试给更长渲染等待)，再退回画布点渲染出的该段。返回 { f, reason }：
+  // reason==='ok' 时 f 是已选中元素的字号框读数；否则 f=null，reason 指出卡在哪一步。
+  async function selectCaptionSegment(page, text) {
+    const dl = text.slice(0, 16); // 诊断标签
+    let reason = "not-selected";
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (!(await openCaptionsPanel())) { reason = "no-panel"; log(`  [诊断] p${page}「${dl}」#${attempt}: 打不开字幕面板`); await sleep(200); continue; }
+      await sleep(250);
+      const line = await findTranscriptLine(page, text);
+      if (!line) { reason = "no-line"; log(`  [诊断] p${page}「${dl}」#${attempt}: 转录面板未找到该行`); await sleep(200); continue; }
+      await clickAt(line.cx, line.cy);        // 关闭面板 + 定位播放头 + 选中该段
+      await sleep(attempt === 1 ? 600 : 950); // 重试时给 Canva 更长时间渲染/带出选中态
+      let f = await readFontField();
+      const f1 = f && f.present ? (isNaN(f.value) ? "NaN(占位--)" : f.value) : "无字号框";
+      if (f && f.present && !isNaN(f.value)) { log(`  [诊断] p${page}「${dl}」#${attempt}: 点转录行(${line.cx},${line.cy})→选中✓ 字号=${f.value}`); return { f, reason: "ok" }; }
+      // 转录点击未带出选中态 → 在画布上点渲染出来的该段
+      const cap = await findRenderedCaption(text);
+      let f2 = "—";
+      if (cap && cap.ok) {
+        await clickAt(cap.cx, cap.cy);
+        await sleep(300);
+        f = await readFontField();
+        f2 = f && f.present ? (isNaN(f.value) ? "NaN" : f.value) : "无字号框";
+        if (f && f.present && !isNaN(f.value)) { log(`  [诊断] p${page}「${dl}」#${attempt}: 画布兜底(${cap.cx},${cap.cy})→选中✓ 字号=${f.value}`); return { f, reason: "ok" }; }
+      }
+      log(`  [诊断] p${page}「${dl}」#${attempt}: 点转录行(${line.cx},${line.cy})→f=${f1}；画布兜底=${cap && cap.ok ? `(${cap.cx},${cap.cy})→f=${f2}` : "未找到渲染段"}`);
+      reason = "not-selected";
+      await pressEscape();                     // 清干净再重试，避免残留态干扰
+      await sleep(150);
+    }
+    return { f: null, reason };
+  }
+
   async function adjustPageCaptionPositionSegs(page, lines, x, y) {
     let applied = 0, errors = 0;
     log(`第 ${page} 页：转录面板字幕 ${lines.length} 段。`);
@@ -1823,59 +2162,42 @@ ${lines}`;
       if (state.cancelled) break;
       const label = text.slice(0, 20);
 
-      if (!(await openCaptionsPanel())) {
-        await waitForUserFix(`无法打开字幕面板：「${label}」`);
+      const sel = await selectCaptionSegment(page, text);
+      if (sel.reason !== "ok") {
+        const msg = {
+          "no-panel": `无法打开字幕面板：「${label}」`,
+          "no-line": `转录面板未找到「${label}」`,
+          "not-selected": `「${label}」未能选中`,
+        }[sel.reason];
+        await waitForUserFix(msg);
         if (state.cancelled) break;
         errors++;
+        await pressEscape();
+        await sleep(150);
         continue;
       }
-      await sleep(250);
-      const line = await findTranscriptLine(page, text);
-      if (!line) {
-        await waitForUserFix(`转录面板未找到「${label}」`);
-        if (state.cancelled) break;
-        errors++;
-        continue;
-      }
-      await clickAt(line.cx, line.cy); // 关闭面板 + 定位播放头 + 选中该段
-      await sleep(600);
-      let f = await readFontField();
-      if (!f || !f.present || isNaN(f.value)) {
-        // 转录点击未带出选中态 → 在画布上点渲染出来的该段
-        const cap = await findRenderedCaption(text);
-        if (cap && cap.ok) {
-          await clickAt(cap.cx, cap.cy);
-          await sleep(300);
-          f = await readFontField();
-        }
-      }
-      if (!f || !f.present || isNaN(f.value)) {
-        await waitForUserFix(`「${label}」未能选中`);
-        if (state.cancelled) break;
-        errors++;
-      } else {
-        const panelOpen = await isPositionPanelOpen();
-        if (!panelOpen) {
-          try {
-            await openPositionPanel();
-          } catch (e) {
-            await waitForUserFix(`「${label}」无法打开位置面板（${e.message}）`);
-            if (state.cancelled) break;
-            errors++;
-            await pressEscape();
-            await sleep(150);
-            continue;
-          }
-        }
-        const res = await setPositionForSelected(x, y);
-        if (res.applied) {
-          log(`  ✓ 「${label}」→ (${x}, ${y})`);
-          applied++;
-        } else {
-          await waitForUserFix(formatPositionFailure(`第${page}页「${label}」`, x, y, res));
+
+      const panelOpen = await isPositionPanelOpen();
+      if (!panelOpen) {
+        try {
+          await openPositionPanel();
+        } catch (e) {
+          await waitForUserFix(`「${label}」无法打开位置面板（${e.message}）`);
           if (state.cancelled) break;
           errors++;
+          await pressEscape();
+          await sleep(150);
+          continue;
         }
+      }
+      const res = await setPositionForSelected(x, y);
+      if (res.applied) {
+        log(`  ✓ 「${label}」→ (${x}, ${y})`);
+        applied++;
+      } else {
+        await waitForUserFix(formatPositionFailure(`第${page}页「${label}」`, x, y, res));
+        if (state.cancelled) break;
+        errors++;
       }
       await pressEscape();
       await sleep(150);
@@ -1891,6 +2213,12 @@ ${lines}`;
 
     for (const t of texts) {
       if (state.cancelled) break;
+      if (await isOnVideoControls(t.cx, t.cy)) {
+        await waitForUserFix(`「${t.text}」被视频播放器控件遮挡，无法点击选中，请手动暂停视频或拖动播放头后重试`);
+        if (state.cancelled) break;
+        errors++;
+        continue;
+      }
       await clickAt(t.cx, t.cy);
       await sleep(300);
 
@@ -1920,13 +2248,10 @@ ${lines}`;
     return { applied, errors };
   }
 
-  async function runSetPosition(x, y, allPages) {
+  // 位置核心：不 attach/detach、不发 done，返回 ok（errors===0）。供 runSetPosition 包装与 runCombo 复用。
+  async function positionCore(x, y, allPages) {
     let applied = 0, errors = 0;
-    try {
-      await chrome.debugger.attach(target, "1.3");
-      await cmd("Runtime.enable");
-      await warnIfNoOverlay();
-
+    {
       const info = await readPageInfo();
 
       // 有原生字幕的设计：先读一次转录面板，拿到每页的全部字幕段，
@@ -1948,8 +2273,7 @@ ${lines}`;
       if (allPages && !info) {
         if (!captionsByPage) {
           log("未能打开 Captions 转录面板，无法枚举全部页（当前设计可能没有 Canva 原生字幕）。");
-          send("done", { ok: false });
-          return;
+          return false;
         }
         const pages = [...captionsByPage.keys()].sort((a, b) => a - b);
         log(`所有页（共 ${pages.length} 页，经字幕面板确认）。`);
@@ -1971,21 +2295,24 @@ ${lines}`;
           if (state.cancelled) break;
           send("status", { text: `第 ${i} / ${total} 页…` });
 
-          if (allPages) {
+          // 有转录字幕的页直接点转录行完成翻页；Duration/Reel 视图可能有 N/M
+          // 页码但没有缩略图，不能在处理字幕前强制依赖 navigateToPage()。
+          const transcriptPage = captionsByPage && captionsByPage.has(i) ? i : null;
+          if (allPages && transcriptPage == null) {
             if (!(await navigateToPage(i))) {
               await waitForUserFix(`第 ${i} 页：未找到页面缩略图，无法翻页（已尝试切换 Pages 视图）`);
               if (state.cancelled) break;
               errors++;
               continue;
             }
+            await sleep(400);
           }
-          await sleep(400);
 
           // 本页有字幕段则走转录面板逐段处理；否则（经典无字幕设计/该页无匹配字幕）
           // 退回画布枚举（只能处理播放头当前渲染的那一段，但这类设计本来就只有一段）
           let handledViaTranscript = false;
           if (captionsByPage) {
-            let capPage = info && captionsByPage.has(i) ? i : null;
+            let capPage = transcriptPage;
             if (capPage == null) capPage = await findCurrentCaptionPage(captionsByPage);
             if (capPage != null && captionsByPage.has(capPage)) {
               const s = await adjustPageCaptionPositionSegs(capPage, captionsByPage.get(capPage), x, y);
@@ -2003,16 +2330,68 @@ ${lines}`;
       }
 
       log(`\n完成：设置 ${applied} 处，失败 ${errors} 处。`);
-      send("done", { ok: errors === 0 });
-    } catch (e) {
-      log("设置位置出错：" + (e && e.message ? e.message : String(e)));
-      send("done", { ok: false });
-    } finally {
-      try { await chrome.debugger.detach(target); } catch (_) {}
+      return errors === 0;
     }
   }
 
-  return { run, runAnimate, runProofread, runApplyCorrections, runAddPages, runPlaceVideos, runReadPosition, runSetPosition };
+  async function runSetPosition(x, y, allPages) {
+    let ok = false;
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      await cmd("Runtime.enable");
+      await warnIfNoOverlay();
+      ok = await positionCore(x, y, allPages);
+    } catch (e) {
+      log("设置位置出错：" + (e && e.message ? e.message : String(e)));
+      ok = false;
+    } finally {
+      try { await chrome.debugger.detach(target); } catch (_) {}
+      send("done", { ok });
+    }
+  }
+
+  // 一键应用：字号→位置→高亮 三步合进【同一个 debugger 会话】——只 attach/detach 一次、
+  // 只发一次 done，从根上消除三步各自 attach 造成的 "Another debugger is already attached" 竞态。
+  async function runCombo({ size, threshold, split, x, y, color, allPages }) {
+    let ok = true;
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      await cmd("Runtime.enable");
+      await warnIfNoOverlay();
+
+      log("== 第 1/3 步：调整字号 ==");
+      send("status", { text: "第 1/3 步：调整字号…" });
+      ok = (await fontCore(size, threshold, allPages, split)) && ok;
+
+      if (!state.cancelled) {
+        if (x && y) {
+          await pressEscape();
+          await sleep(200);
+          log("\n== 第 2/3 步：统一位置 ==");
+          send("status", { text: "第 2/3 步：统一位置…" });
+          ok = (await positionCore(x, y, allPages)) && ok;
+        } else {
+          log("\n（未填写位置坐标，跳过统一位置这一步）");
+        }
+      }
+
+      if (!state.cancelled) {
+        await pressEscape();
+        await sleep(200);
+        log("\n== 第 3/3 步：套用高亮动画 ==");
+        send("status", { text: "第 3/3 步：套用高亮动画…" });
+        ok = (await animateCore(color, allPages)) && ok;
+      }
+    } catch (e) {
+      log("运行出错：" + (e && e.message ? e.message : String(e)));
+      ok = false;
+    } finally {
+      try { await chrome.debugger.detach(target); } catch (_) {}
+      send("done", { ok: ok && !state.cancelled });
+    }
+  }
+
+  return { run, runCombo, runAnimate, runProofread, runApplyCorrections, runAddPages, runPlaceVideos, runReadPosition, runSetPosition };
 }
 
 // 点击工具栏图标打开侧边栏（常驻，不像 popup 那样一点别处就关闭）
@@ -2039,6 +2418,7 @@ chrome.runtime.onConnect.addListener((port) => {
     const runner = makeRunner(msg.tabId, port, state);
     const allPages = msg.allPages !== false;
     if (msg.type === "run") await runner.run(msg.size, msg.threshold, allPages, msg.split || null);
+    else if (msg.type === "combo") await runner.runCombo({ size: msg.size, threshold: msg.threshold, split: msg.split || null, x: msg.x, y: msg.y, color: msg.color, allPages });
     else if (msg.type === "animate") await runner.runAnimate(msg.color, allPages);
     else if (msg.type === "proofread") await runner.runProofread({ provider: msg.provider, apiKey: msg.apiKey, model: msg.model }, allPages, msg.rules || "");
     else if (msg.type === "apply-corrections") await runner.runApplyCorrections(msg.corrections, allPages);

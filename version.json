@@ -1,6 +1,6 @@
 {
-  "version": "1.0.44",
+  "version": "1.0.45",
   "minVersion": "1.0.0",
   "downloadUrl": "https://github.com/stevenpcny/canva-font-plugin/releases/latest",
-  "notes": "全功能遇到失败不再静默跳过：暂停并提示用户手动处理，用户确认后再继续处理下一项；应用位置改为填值后两阶段回读校验（Enter 前/后各核对一次 X/Y），避免因点击目标被播放器控件遮挡等原因导致误报成功。同时修复视频类设计里探测字幕时误点播放按钮的问题。"
+  "notes": "增强 Canva 新版页面与字幕结构兼容：支持时间轴按钮、零尺寸页面节点及中英文 Captions/页码；Transcript 逐段处理字幕并避免静态文本重复修改；新增自定义水印关键词和单 debugger 会话的一键组合操作。位置与 Highlight 现与字号共用 Transcript 导航，翻页也必须读回目标页码后才继续。"
 }

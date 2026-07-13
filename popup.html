@@ -124,6 +124,12 @@
     <div class="hint">例如阈值 30：会改 56 号的字幕，跳过 24 号的「AI generated video」水印。</div>
   </div>
 
+  <div class="row">
+    <label for="watermarkKeywords">水印关键词（自动跳过含这些文字的文本框，逗号/换行分隔）</label>
+    <textarea id="watermarkKeywords" rows="2" style="text-transform:none;" placeholder="如：elevenlabs, my-brand.com"></textarea>
+    <div class="hint">内置已跳过含 "AI generated"、"elevenlabs" 的文本框；这里可补充你自己加的水印文案，不区分大小写。</div>
+  </div>
+
   <button id="run">应用到所有页面</button>
 
   <hr />
